@@ -1,10 +1,15 @@
-//! UI state and the logic that turns a tree into rows (spec 4.6). No drawing,
-//! no terminal.
+//! The UI (spec 4.6): its state, the logic that turns a tree into rows, and
+//! the drawing of those rows ([`render`]). Only [`render`] knows about the
+//! terminal.
 
 pub mod flatten;
+#[cfg(test)]
+pub(crate) mod mock;
+pub mod render;
 pub mod state;
 
 pub use flatten::{Row, flatten, merge_exited, reselect};
+pub use render::{Layout, View, draw};
 pub use state::{Action, Dialog, SortKey, UiState, apply, note_seen};
 
 #[cfg(test)]
@@ -14,8 +19,8 @@ mod tests {
     use crate::i18n::Lang;
     use crate::model::ProcKey;
     use crate::testkit::{base, p, tree};
-    use crate::tree::{self, Label, Node, NodeId, ViewMode};
-    use std::collections::HashSet;
+    use crate::tree::{self, Label, NodeId, ViewMode};
+    use crate::ui::mock::all_ids;
     use std::time::{Duration, Instant};
 
     fn st() -> UiState {
@@ -112,13 +117,6 @@ mod tests {
         s.selected = Some(r[1].id.clone());
         apply(&mut s, &Action::Collapse, &r, 10);
         assert_eq!(s.selected, Some(NodeId::Category(Category::ClaudeCode)));
-    }
-
-    fn all_ids(ns: &[Node], out: &mut HashSet<NodeId>) {
-        for n in ns {
-            out.insert(n.id.clone());
-            all_ids(&n.children, out);
-        }
     }
 
     #[test]
