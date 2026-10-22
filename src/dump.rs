@@ -34,9 +34,9 @@ pub fn anonymize(s: &Snapshot) -> Snapshot {
     let mut procs = Vec::with_capacity(s.procs.len());
     for p in &s.procs {
         let mut q = p.clone();
-        q.exe = p.exe.as_deref().map(&tilde);
+        q.exe = p.exe.as_deref().map(tilde);
         q.argv = mask_argv(&p.argv).iter().map(|a| tilde(a)).collect();
-        q.cwd = p.cwd.as_deref().map(&tilde);
+        q.cwd = p.cwd.as_deref().map(tilde);
         q.env = p
             .env
             .iter()
