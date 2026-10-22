@@ -1167,8 +1167,18 @@ mod tests {
     }
 
     fn render(w: u16, h: u16, expand_all: bool, f: impl FnOnce(&mut UiState)) -> String {
+        render_in(Lang::ZhTw, w, h, expand_all, f)
+    }
+
+    fn render_in(
+        lang: Lang,
+        w: u16,
+        h: u16,
+        expand_all: bool,
+        f: impl FnOnce(&mut UiState),
+    ) -> String {
         let (s, c, t) = mock_fixture();
-        let mut st = UiState::new(Lang::ZhTw);
+        let mut st = UiState::new(lang);
         if expand_all {
             all_ids(&t, &mut st.expanded);
         }
@@ -1193,19 +1203,27 @@ mod tests {
         screen(&term)
     }
 
+    /// The state of the spec mockup: the first session and `chrome-live`
+    /// open, the cursor on the server of `chrome-live`.
+    fn open_the_mockup_state(s: &mut UiState) {
+        let session = proc_key(49049);
+        s.expanded.extend([
+            NodeId::Proc(session),
+            NodeId::McpGroup(session),
+            NodeId::Mcp(proc_key(49815)),
+        ]);
+        s.selected = Some(NodeId::Proc(proc_key(50094)));
+    }
+
     #[test]
     fn render_main_100x30_zh() {
-        // The state of the spec mockup: the first session and `chrome-live`
-        // open, the cursor on the server of `chrome-live`.
-        insta::assert_snapshot!(render(100, 30, false, |s| {
-            let session = proc_key(49049);
-            s.expanded.extend([
-                NodeId::Proc(session),
-                NodeId::McpGroup(session),
-                NodeId::Mcp(proc_key(49815)),
-            ]);
-            s.selected = Some(NodeId::Proc(proc_key(50094)));
-        }));
+        insta::assert_snapshot!(render(100, 30, false, open_the_mockup_state));
+    }
+
+    /// The same screen in English; the README shows it.
+    #[test]
+    fn render_main_100x30_en() {
+        insta::assert_snapshot!(render_in(Lang::En, 100, 30, false, open_the_mockup_state));
     }
 
     #[test]
@@ -1254,6 +1272,23 @@ mod tests {
             s.help_scroll = u16::MAX;
         });
         assert!(end.contains("非官方工具") && !end.contains("↓ 還有更多"));
+    }
+
+    #[test]
+    fn help_footer_says_how_to_scroll_once() {
+        // "↑↓ 捲動" belongs to the "more below" hint only; the close hint
+        // next to it must not repeat it.
+        let top = render(80, 24, false, |s| s.help_open = true);
+        assert_eq!(top.matches("↑↓ 捲動").count(), 1, "{top}");
+        assert!(top.contains("Esc／q／? 關閉說明"));
+        let end = render(80, 24, false, |s| {
+            s.help_open = true;
+            s.help_scroll = u16::MAX;
+        });
+        assert_eq!(end.matches("↑↓ 捲動").count(), 0, "{end}");
+        let en = render_in(Lang::En, 80, 24, false, |s| s.help_open = true);
+        assert_eq!(en.matches("↑↓ scroll").count(), 1, "{en}");
+        assert!(en.contains("Esc / q / ? to close"));
     }
 
     #[test]

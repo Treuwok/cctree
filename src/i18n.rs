@@ -186,8 +186,8 @@ catalog! {
         "CPU: on macOS and Linux 100% is one core and it can go above 100% (like Activity Monitor and top); on Windows 100% is the whole machine (like Task Manager).",
     ),
     HelpNoteOrphan => (
-        "已失聯：主人已經結束，它卻還留著。標「確定」的可以整批清理；標「疑似」的可能是你正在用的 app，請個別確認後再用 x 結束。",
-        "Orphaned: its owner has ended but it is still there. Ones marked \"confirmed\" can be cleaned up as a batch; ones marked \"suspected\" may be an app you are using, so check each one and end it with x.",
+        "已失聯：主人已經結束，它卻還留著。「確定」和「疑似」只是提示，不會批次結束；「疑似」的可能是你正在用的 app。要結束請選到那一列，個別確認後按 x。",
+        "Orphaned: its owner has ended but it is still there. \"Confirmed\" and \"suspected\" are only hints and nothing is ended in a batch; a suspected one may be an app you are using. To end one, select its row, check it and press x.",
     ),
     HelpNoteKill => (
         "按 x 或 X 結束 process 前，會先列出要結束的項目，按 Enter 確定、Esc 取消；只需要確認這一次。",
@@ -213,7 +213,7 @@ catalog! {
         "非官方工具，與 Anthropic、OpenAI 無關。",
         "Unofficial tool; not affiliated with Anthropic or OpenAI.",
     ),
-    HelpClose => ("Esc／q／? 關閉說明，↑↓ 捲動", "Esc / q / ? close · ↑↓ scroll"),
+    HelpClose => ("Esc／q／? 關閉說明", "Esc / q / ? to close"),
     /// At the foot of the help page while there is more below; the arrow
     /// keys scroll it.
     HelpMore => ("↓ 還有更多（↑↓ 捲動）", "↓ more (↑↓ scroll)"),
@@ -532,17 +532,6 @@ pub fn kill_more(lang: Lang, n: usize) -> String {
     match lang {
         Lang::ZhTw => format!("還有 {n} 個"),
         Lang::En => format!("{n} more"),
-    }
-}
-
-/// "另有 2 個疑似失聯的沒有包含": batch cleanup of orphans skips the suspected.
-pub fn kill_excluded_suspected(lang: Lang, n: usize) -> String {
-    match lang {
-        Lang::ZhTw => format!("另有 {n} 個疑似失聯的沒有包含"),
-        Lang::En => format!(
-            "{n} suspected orphan{} not included",
-            if n == 1 { " is" } else { "s are" }
-        ),
     }
 }
 
@@ -1537,18 +1526,6 @@ mod tests {
         );
         assert_eq!(kill_more(zh, 4), "還有 4 個");
         assert_eq!(kill_more(en, 4), "4 more");
-        assert_eq!(
-            kill_excluded_suspected(zh, 2),
-            "另有 2 個疑似失聯的沒有包含"
-        );
-        assert_eq!(
-            kill_excluded_suspected(en, 1),
-            "1 suspected orphan is not included"
-        );
-        assert_eq!(
-            kill_excluded_suspected(en, 2),
-            "2 suspected orphans are not included"
-        );
         assert_eq!(
             kill_interrupts(zh, Some("~/prj/cctree"), Resume::Command("claude --resume")),
             "這會中斷 ~/prj/cctree 的對話；對話紀錄不會遺失，之後可以用 `claude --resume` 接續"
