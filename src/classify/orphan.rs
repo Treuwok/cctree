@@ -38,9 +38,8 @@
 //!
 //! # When an orphan is confirmed
 //!
-//! A confirmed orphan group may be ended as a whole, so strong and medium
-//! evidence give a confirmed orphan only when all of these hold, and a
-//! suspected one otherwise (same reason):
+//! Strong and medium evidence give a confirmed orphan only when all of these
+//! hold, and a suspected one otherwise (same reason):
 //!
 //! - nobody meaningful is its parent ([`Lineage::is_adopted`]: no valid
 //!   parent, PID 1 or a subreaper), so no live process (a terminal
