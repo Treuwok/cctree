@@ -1,6 +1,7 @@
-//! Ending processes (spec 4.7), the planning half: [`plan_kill`] works out
-//! exactly which processes `x` or `X` on a row would end, in which order, or
-//! why it must not. Nothing is signalled here.
+//! Ending processes (spec 4.7). [`plan_kill`] works out exactly which
+//! processes `x` or `X` on a row would end, in which order, or why it must
+//! not; it signals nothing. [`execute`] then carries a plan out through a
+//! [`ProcessControl`] ([`OsControl`] is the real one); see its documentation.
 //!
 //! # Rules
 //!
@@ -74,12 +75,17 @@
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::classify::argv::display_name;
 use crate::classify::lineage::Lineage;
 use crate::classify::{Classification, Role, SessionInfo};
 use crate::model::{Pid, Platform, ProcKey, ProcStatus, RawProc, Snapshot, Tool};
 use crate::tree::{Node, NodeId, find, member_keys};
+
+mod os;
+pub use os::OsControl;
 
 /// `x` ends the process of the row; `X` the whole tree or group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -433,6 +439,164 @@ fn plan_parent(
     }
 }
 
+/// What a plan target is now, compared with when the plan was made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcState {
+    /// Running, with the same start time.
+    Same,
+    /// Not running any more. A zombie counts: it has ended and only waits for
+    /// its parent to collect it.
+    Gone,
+    /// The PID now belongs to a process that started later: not the one the
+    /// plan meant, so it must not be touched.
+    Reused,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KillError {
+    PermissionDenied,
+    /// No such process (any more).
+    NotFound,
+    Other(String),
+}
+
+/// What [`execute`] needs from the operating system.
+pub trait ProcessControl: Send + Sync {
+    fn state(&self, key: ProcKey) -> ProcState;
+    /// Asks the process to end (SIGTERM).
+    fn terminate(&self, pid: Pid) -> Result<(), KillError>;
+    /// Ends the process without asking (SIGKILL, TerminateProcess).
+    fn force(&self, pid: Pid) -> Result<(), KillError>;
+}
+
+/// How [`execute`] went. Every target is counted once: `graceful` + `forced`
+/// + `already_gone` + `skipped_reused` + `failed` is the number of targets.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KillReport {
+    /// Ended after being asked to.
+    pub graceful: usize,
+    /// Still running when the grace period ran out, ended by force (always
+    /// the case for a `force_only` plan).
+    pub forced: usize,
+    /// Ended by themselves before or while being signalled, zombies included.
+    pub already_gone: usize,
+    /// The PID belongs to another process now; left alone.
+    pub skipped_reused: Vec<Pid>,
+    pub failed: Vec<(Pid, KillError)>,
+}
+
+impl KillReport {
+    /// A signal found nothing to signal: the process ended by itself. Any
+    /// other error is a failure.
+    fn signal_failed(&mut self, pid: Pid, e: KillError) {
+        match e {
+            KillError::NotFound => self.already_gone += 1,
+            e => self.failed.push((pid, e)),
+        }
+    }
+}
+
+/// Carries out `plan`, deepest target first:
+///
+/// 1. each target is looked at once: [`ProcState::Gone`] is counted as
+///    already gone and [`ProcState::Reused`] is skipped, so a recycled PID is
+///    never signalled;
+/// 2. a plan that is not `force_only` asks every remaining target to end
+///    ([`ProcessControl::terminate`]), then checks every `poll` until all are
+///    gone or `grace` is over;
+/// 3. whatever is left (all remaining targets, for a `force_only` plan) is
+///    ended by [`ProcessControl::force`].
+///
+/// A signal that finds no process counts as already gone, not as a failure.
+/// `progress(done, total)` is called each time a target is dealt with, so the
+/// last call is `(total, total)`. Blocks for up to `grace`.
+pub fn execute(
+    plan: &KillPlan,
+    ctl: &dyn ProcessControl,
+    grace: Duration,
+    poll: Duration,
+    progress: &mut dyn FnMut(usize, usize),
+) -> KillReport {
+    let total = plan.targets.len();
+    let mut done = 0;
+    let mut tick = || {
+        done += 1;
+        progress(done, total);
+    };
+    let mut report = KillReport::default();
+
+    let mut live: Vec<ProcKey> = Vec::new();
+    for t in &plan.targets {
+        match ctl.state(t.key) {
+            ProcState::Gone => {
+                report.already_gone += 1;
+                tick();
+            }
+            ProcState::Reused => {
+                report.skipped_reused.push(t.key.pid);
+                tick();
+            }
+            ProcState::Same => live.push(t.key),
+        }
+    }
+
+    if !plan.force_only {
+        let mut asked: Vec<ProcKey> = Vec::new();
+        for k in live {
+            match ctl.terminate(k.pid) {
+                Ok(()) => asked.push(k),
+                Err(e) => {
+                    report.signal_failed(k.pid, e);
+                    tick();
+                }
+            }
+        }
+        let deadline = Instant::now() + grace;
+        loop {
+            asked.retain(|&k| {
+                let ended = ctl.state(k) != ProcState::Same;
+                if ended {
+                    report.graceful += 1;
+                    tick();
+                }
+                !ended
+            });
+            if asked.is_empty() || Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(poll);
+        }
+        live = asked;
+    }
+
+    for k in live {
+        match ctl.force(k.pid) {
+            Ok(()) => report.forced += 1,
+            Err(e) => report.signal_failed(k.pid, e),
+        }
+        tick();
+    }
+    report
+}
+
+/// A plan that ends `pid` and every one of its descendants in the validated
+/// lineage, in the same order as [`plan_kill`] (deepest first). It skips the
+/// refusals and the classification: it exists for tests that end real
+/// processes they started themselves. An unknown `pid` gives no targets.
+#[doc(hidden)]
+pub fn plan_for_pid_tree(snap: &Snapshot, pid: Pid) -> KillPlan {
+    let cls = Classification::default();
+    let ctx = Ctx::new(snap, &cls);
+    let root = ctx.l.key_of(pid);
+    let keys = root.map_or_else(Vec::new, |root| {
+        let mut keys = vec![root];
+        keys.extend(ctx.l.descendants(root));
+        kill_order(&ctx.l, &cls, &keys)
+    });
+    let subject = root.unwrap_or(ProcKey { pid, start_time: 0 });
+    ctx.plan(&NodeId::Proc(subject), keys)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +606,7 @@ mod tests {
     use crate::testkit::{base, cfgs, p, snap};
     use crate::tree::{ViewMode, build_tree};
     use std::collections::HashSet;
+    use std::sync::Mutex;
 
     const SID: &str = "CLAUDE_CODE_SESSION_ID";
     const PROJ: &str = "CLAUDE_PROJECT_DIR";
@@ -1101,5 +1266,148 @@ mod tests {
         // Another user's process is fine now; a root process still is not.
         assert_eq!(pids(&one(252).unwrap()), [252]);
         assert_eq!(one(251), Err(KillRefusal::System { pid: 251 }));
+    }
+
+    struct FakeProc {
+        alive: bool,
+        ignores_term: bool,
+        reused: bool,
+    }
+
+    /// A pretend operating system: each process is alive or not, may ignore
+    /// `terminate`, and may be a different process now that has the same PID.
+    struct FakeControl {
+        procs: Mutex<HashMap<Pid, FakeProc>>,
+        signalled: Mutex<Vec<Pid>>,
+        terminates: Mutex<usize>,
+    }
+
+    impl FakeControl {
+        /// `(pid, alive, ignores_term, reused)` for each process.
+        fn new<const N: usize>(v: [(Pid, bool, bool, bool); N]) -> FakeControl {
+            let procs = v
+                .into_iter()
+                .map(|(pid, alive, ignores_term, reused)| {
+                    (
+                        pid,
+                        FakeProc {
+                            alive,
+                            ignores_term,
+                            reused,
+                        },
+                    )
+                })
+                .collect();
+            FakeControl {
+                procs: Mutex::new(procs),
+                signalled: Mutex::new(Vec::new()),
+                terminates: Mutex::new(0),
+            }
+        }
+
+        fn was_signalled(&self, pid: Pid) -> bool {
+            self.signalled.lock().unwrap().contains(&pid)
+        }
+
+        fn terminate_calls(&self) -> usize {
+            *self.terminates.lock().unwrap()
+        }
+
+        /// Signals `pid`; `ends` says whether the process dies of it.
+        fn signal(&self, pid: Pid, ends: impl Fn(&FakeProc) -> bool) -> Result<(), KillError> {
+            self.signalled.lock().unwrap().push(pid);
+            match self.procs.lock().unwrap().get_mut(&pid) {
+                Some(p) if p.alive => {
+                    p.alive = !ends(p);
+                    Ok(())
+                }
+                _ => Err(KillError::NotFound),
+            }
+        }
+    }
+
+    impl ProcessControl for FakeControl {
+        fn state(&self, key: ProcKey) -> ProcState {
+            match self.procs.lock().unwrap().get(&key.pid) {
+                Some(p) if p.alive && p.reused => ProcState::Reused,
+                Some(p) if p.alive => ProcState::Same,
+                _ => ProcState::Gone,
+            }
+        }
+
+        fn terminate(&self, pid: Pid) -> Result<(), KillError> {
+            *self.terminates.lock().unwrap() += 1;
+            self.signal(pid, |p| !p.ignores_term)
+        }
+
+        fn force(&self, pid: Pid) -> Result<(), KillError> {
+            self.signal(pid, |_| true)
+        }
+    }
+
+    /// A plan that ends `pids` in this order, every other field at its default.
+    fn plan_of(pids: &[Pid]) -> KillPlan {
+        KillPlan {
+            subject: NodeId::OtherGroup(String::new()),
+            targets: pids
+                .iter()
+                .map(|&pid| KillTarget {
+                    key: ProcKey { pid, start_time: 0 },
+                    name: String::new(),
+                    detached: false,
+                    mem: None,
+                })
+                .collect(),
+            warnings: Vec::new(),
+            freed: 0,
+            freed_approx: false,
+            force_only: false,
+        }
+    }
+
+    #[test]
+    fn graceful_forced_gone_and_reused() {
+        // (pid, alive, ignores_term, reused): pid 1 is gone from the start;
+        // pid 2 ignores SIGTERM; pid 4's PID now belongs to another process.
+        let ctl = FakeControl::new([
+            (1, false, false, false),
+            (2, true, true, false),
+            (4, true, false, true),
+        ]);
+        let plan = plan_of(&[2, 4, 1]);
+        let mut seen = vec![];
+        let r = execute(
+            &plan,
+            &ctl,
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+            &mut |d, t| seen.push((d, t)),
+        );
+        assert_eq!(
+            (
+                r.graceful,
+                r.forced,
+                r.already_gone,
+                r.skipped_reused.clone()
+            ),
+            (0, 1, 1, vec![4])
+        );
+        assert_eq!(seen.last(), Some(&(3, 3)));
+        assert!(!ctl.was_signalled(4));
+    }
+
+    #[test]
+    fn force_only_never_terminates() {
+        let ctl = FakeControl::new([(5, true, false, false)]);
+        let mut plan = plan_of(&[5]);
+        plan.force_only = true;
+        let r = execute(
+            &plan,
+            &ctl,
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+            &mut |_, _| {},
+        );
+        assert_eq!((r.forced, ctl.terminate_calls()), (1, 0));
     }
 }
