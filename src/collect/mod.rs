@@ -14,6 +14,13 @@
 //!    every refresh whatever the refresh kind says, so a second refresh would
 //!    compare against a baseline taken milliseconds earlier and read ~0
 //!    (spec 4.9, pinned by `busy_child_reports_real_cpu`).
+//!
+//!    The refresh's job is to keep each process's `accumulated_cpu_time` fresh;
+//!    the percentage is then taken from the change in that figure between two
+//!    snapshots ([`cpu_percent`]), not from sysinfo's own `cpu_usage()`. The
+//!    latter is wrong on its first reading on some platforms: on Windows the
+//!    first value is measured against a zero baseline (about 0 %), on Linux and
+//!    macOS it is skipped when the baseline is exactly 0 (a very young process).
 //! 2. **Environment variables are read only through a throwaway `System`** that
 //!    is dropped right after [`env::extract_env`]. The long-lived `sys` never
 //!    holds environ: sysinfo caches the whole environment, which for MCP child
@@ -21,7 +28,7 @@
 //!    (spec 4.3, pinned by `main_system_never_holds_environ`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sysinfo::{
     Pid as SysPid, Process, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, Uid,
@@ -39,14 +46,24 @@ pub mod mem;
 /// command line cannot be read (spec 4.8).
 const TOOL_NAMES: &[&str] = &["node", "npm", "npx", "bun", "deno", "claude", "codex"];
 
-/// Converts sysinfo's CPU figure to cctree's: Windows is a share of the whole
-/// machine (like Task Manager), macOS and Linux a share of one core (like
-/// `top`). sysinfo reports a per-core figure on every platform.
+/// Converts a per-core CPU percentage (100 = one core fully busy) to cctree's
+/// unit: Windows is a share of the whole machine (like Task Manager), macOS and
+/// Linux stay a share of one core (like `top`).
 pub fn normalize_cpu(raw: f32, platform: Platform, logical_cpus: usize) -> f32 {
     match platform {
         Platform::Windows => raw / logical_cpus.max(1) as f32,
         Platform::MacOs | Platform::Linux => raw,
     }
+}
+
+/// Per-core CPU percentage between two readings of a process's accumulated CPU
+/// time (milliseconds) taken `elapsed` apart: 100 means one core fully busy.
+fn cpu_percent(prev_ms: u64, now_ms: u64, elapsed: Duration) -> f32 {
+    let wall_ms = elapsed.as_secs_f32() * 1000.0;
+    if wall_ms <= 0.0 {
+        return 0.0;
+    }
+    now_ms.saturating_sub(prev_ms) as f32 / wall_ms * 100.0
 }
 
 /// Fields read once per process and cached by [`ProcKey`].
@@ -65,8 +82,9 @@ pub struct Collector {
     /// process's environment (see the module docs).
     sys: System,
     statics: HashMap<ProcKey, StaticInfo>,
-    /// Keys whose first (always zero) CPU reading has already been discarded.
-    cpu_seen: HashSet<ProcKey>,
+    /// The previous reading of each process's accumulated CPU time (ms) and
+    /// when it was taken. A key without an entry has no CPU figure yet.
+    cpu_prev: HashMap<ProcKey, (u64, Instant)>,
     own_uid: Option<Uid>,
     self_pid: SysPid,
     home: Option<String>,
@@ -84,7 +102,7 @@ impl Collector {
         Collector {
             sys,
             statics: HashMap::new(),
-            cpu_seen: HashSet::new(),
+            cpu_prev: HashMap::new(),
             own_uid: None,
             self_pid: sysinfo::get_current_pid()
                 .unwrap_or_else(|_| SysPid::from_u32(std::process::id())),
@@ -100,6 +118,7 @@ impl Collector {
     pub fn snapshot(&mut self) -> Snapshot {
         // `without_tasks()` is required: on Linux threads would otherwise be
         // listed as processes. `with_cpu()` must stay here (module docs, rule 1).
+        // Without it `accumulated_cpu_time` would not be refreshed at all.
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
@@ -110,6 +129,7 @@ impl Collector {
                 .with_cmd(UpdateKind::OnlyIfNotSet)
                 .with_exe(UpdateKind::OnlyIfNotSet),
         );
+        let sampled_at = Instant::now();
         if self.own_uid.is_none() {
             self.own_uid = self
                 .sys
@@ -169,12 +189,15 @@ impl Collector {
         let mut procs = Vec::with_capacity(live.len());
         for (key, p) in &live {
             let info = &self.statics[key];
-            // The first reading of a key is always 0, so it is not a real one.
-            let cpu = if self.cpu_seen.insert(*key) {
-                None
-            } else {
-                Some(normalize_cpu(p.cpu_usage(), platform, self.logical_cpus))
-            };
+            // One reading is not enough: CPU needs the change since the last one.
+            let accumulated_ms = p.accumulated_cpu_time();
+            let cpu = self
+                .cpu_prev
+                .insert(*key, (accumulated_ms, sampled_at))
+                .map(|(prev_ms, prev_at)| {
+                    let raw = cpu_percent(prev_ms, accumulated_ms, sampled_at - prev_at);
+                    normalize_cpu(raw, platform, self.logical_cpus)
+                });
             procs.push(RawProc {
                 key: *key,
                 ppid: p.parent().map(|pp| pp.as_u32()),
@@ -195,7 +218,7 @@ impl Collector {
         // Forget processes that are gone.
         let alive: HashSet<ProcKey> = procs.iter().map(|p| p.key).collect();
         self.statics.retain(|k, _| alive.contains(k));
-        self.cpu_seen.retain(|k| alive.contains(k));
+        self.cpu_prev.retain(|k, _| alive.contains(k));
 
         let self_key = ProcKey {
             pid: self.self_pid.as_u32(),
@@ -416,6 +439,16 @@ mod tests {
     }
 
     #[test]
+    fn cpu_percent_is_cpu_time_over_wall_time() {
+        let s = Duration::from_secs;
+        assert_eq!(cpu_percent(1000, 3000, s(2)), 100.0); // one core, fully busy
+        assert_eq!(cpu_percent(0, 4000, s(2)), 200.0); // two cores
+        assert_eq!(cpu_percent(500, 500, s(2)), 0.0);
+        assert_eq!(cpu_percent(900, 100, s(2)), 0.0); // clock went backwards: no panic
+        assert_eq!(cpu_percent(0, 10, Duration::ZERO), 0.0);
+    }
+
+    #[test]
     fn snapshot_contains_self_and_spawned_child() {
         let child = spawn_sleeper();
         let mut c = Collector::new();
@@ -465,11 +498,6 @@ mod tests {
                 .spawn()
                 .unwrap(),
         );
-        // sysinfo skips the CPU figure when a process's *first* reading of CPU
-        // time is exactly 0 (macOS: any process younger than a few ms; Linux:
-        // younger than one 10 ms tick). Let the child burn some CPU first, so
-        // this test measures the two-tier design and not that start-up quirk.
-        std::thread::sleep(std::time::Duration::from_millis(300));
         let mut c = Collector::new();
         c.snapshot();
         std::thread::sleep(std::time::Duration::from_millis(1500));
