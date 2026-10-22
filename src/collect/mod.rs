@@ -77,8 +77,11 @@ fn cpu_percent(prev_ms: u64, now_ms: u64, elapsed: Duration) -> f32 {
 ///
 /// Both rules need every element after `raw[0]` to be empty or to look like
 /// `NAME=...`; otherwise `raw` is returned unchanged.
-/// * A: `raw[0]` contains whitespace (a title of several words). The result is
-///   its whitespace-separated words.
+/// * A: `raw[0]` contains whitespace (a title of several words), and either
+///   something follows it or `exe` has another file name than `raw[0]`. The
+///   result is its whitespace-separated words. A lone `raw[0]` that names the
+///   executable is a real path with a space (`C:\Users\John Smith\...\claude.exe`
+///   started with no arguments) and stays.
 /// * B: `raw[0]` is one word, at least one element follows, and the executable
 ///   `exe` is known and has another file name (ignoring case, `.exe` and the
 ///   directory) than `raw[0]` (`chrome-devtools-mcp` running as `node`). The
@@ -91,13 +94,12 @@ pub fn normalize_argv(raw: Vec<String>, exe: Option<&str>) -> Vec<String> {
     if !rest.iter().all(|a| a.is_empty() || is_env_like(a)) {
         return raw;
     }
-    if first.contains(|c: char| c.is_ascii_whitespace()) {
+    let renamed = exe.is_some_and(|e| !program_stem(e).eq_ignore_ascii_case(program_stem(first)));
+    if first.contains(|c: char| c.is_ascii_whitespace()) && (!rest.is_empty() || renamed) {
         let words: Vec<String> = first.split_ascii_whitespace().map(str::to_string).collect();
         return if words.is_empty() { raw } else { words };
     }
-    let retitled = !first.is_empty()
-        && !rest.is_empty()
-        && exe.is_some_and(|e| !program_stem(e).eq_ignore_ascii_case(program_stem(first)));
+    let retitled = !first.is_empty() && !rest.is_empty() && renamed;
     if retitled { vec![first.clone()] } else { raw }
 }
 
@@ -536,15 +538,35 @@ mod tests {
             normalize_argv(strings(&["npm exec @playwright/mcp@latest", "", ""]), None),
             strings(&["npm", "exec", "@playwright/mcp@latest"])
         );
-        // A lone argv[0] with whitespace is split too.
+        // A lone argv[0] with whitespace is split too when the executable is another program.
+        let node = Some("/usr/bin/node");
         assert_eq!(
-            normalize_argv(strings(&["a b"]), None),
+            normalize_argv(strings(&["a b"]), node),
             strings(&["a", "b"])
         );
         assert_eq!(
-            normalize_argv(strings(&["a \t b"]), None),
+            normalize_argv(strings(&["a \t b"]), node),
             strings(&["a", "b"])
         );
+    }
+
+    // PR review: a program started by its full path with a space and no arguments
+    // (PowerShell runs `claude` as "C:\Users\John Smith\...\claude.exe").
+    #[test]
+    fn normalize_argv_keeps_a_lone_executable_path_with_a_space() {
+        for (argv0, exe) in [
+            (
+                "C:\\Users\\John Smith\\.local\\bin\\claude.exe",
+                Some("C:\\Users\\John Smith\\.local\\bin\\claude.exe"),
+            ),
+            (
+                "/Users/u/Library/Application Support/Claude/claude-code/2.1.0/claude",
+                Some("/Users/u/Library/Application Support/Claude/claude-code/2.1.0/claude"),
+            ),
+            ("/Applications/Foo Bar.app/Contents/MacOS/Foo Bar", None),
+        ] {
+            assert_eq!(normalize_argv(strings(&[argv0]), exe), strings(&[argv0]));
+        }
     }
 
     #[test]
