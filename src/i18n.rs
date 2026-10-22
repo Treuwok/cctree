@@ -615,7 +615,7 @@ pub fn help_keys(lang: Lang) -> &'static [(&'static str, &'static str)] {
         ("X", "結束整棵或整組"),
         ("m", "切換 MCP 總覽"),
         ("s", "切換排序（記憶體 → CPU → PID → 名稱）"),
-        ("/", "搜尋名稱、命令列或 PID；Esc 清除"),
+        ("/", "搜尋名稱或 PID；Esc 清除"),
         ("空白鍵", "暫停或恢復更新"),
         ("+ -", "調整更新間隔，1～10 秒"),
         ("?", "說明"),
@@ -631,7 +631,7 @@ pub fn help_keys(lang: Lang) -> &'static [(&'static str, &'static str)] {
         ("X", "End the whole tree or group"),
         ("m", "Switch the MCP overview on or off"),
         ("s", "Change the sort (memory → CPU → PID → name)"),
-        ("/", "Search names, command lines or PIDs; Esc clears"),
+        ("/", "Search names or PIDs; Esc clears"),
         ("Space", "Pause or resume updates"),
         ("+ -", "Change the refresh interval, 1 to 10 s"),
         ("?", "Help"),
@@ -775,8 +775,8 @@ pub fn msg(lang: Lang, m: &Msg) -> String {
             Lang::En => "This row is a group of processes; press X to end the whole group".to_string(),
         },
         Msg::KillRefusedCategory => match lang {
-            Lang::ZhTw => "這一列是整個分類，範圍太大；請到個別 session 或分組上按 X".to_string(),
-            Lang::En => "This row is a whole category, which is too broad; press X on an individual session or group instead".to_string(),
+            Lang::ZhTw => "這一列是整個分類，範圍太大；請到它底下的個別列上按 X".to_string(),
+            Lang::En => "This row is a whole category — too broad. Press X on an individual row under it.".to_string(),
         },
         Msg::KillRefusedSelf => match lang {
             Lang::ZhTw => "不能結束這一個：它是 cctree 自己，或是執行 cctree 的 shell／終端機，結束它會讓 cctree 一起關閉；要離開請按 q".to_string(),
@@ -1093,7 +1093,7 @@ mod tests {
     fn controller_fixed_copy() {
         assert_eq!(
             msg(Lang::ZhTw, &Msg::KillRefusedCategory),
-            "這一列是整個分類，範圍太大；請到個別 session 或分組上按 X"
+            "這一列是整個分類，範圍太大；請到它底下的個別列上按 X"
         );
         assert!(
             msg(Lang::ZhTw, &Msg::WslHint)

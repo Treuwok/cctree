@@ -95,7 +95,7 @@ Run `cctree` in a terminal (at least 80×24). No options are needed. The mouse w
 | `X` | End the whole tree or group |
 | `m` | Switch the MCP overview on or off |
 | `s` | Change the sort (memory → CPU → PID → name) |
-| `/` | Search names, command lines or PIDs; Esc clears |
+| `/` | Search names or PIDs; Esc clears |
 | `Space` | Pause or resume updates |
 | `+ -` | Change the refresh interval, 1 to 10 s |
 | `?` | Help |
