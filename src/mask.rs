@@ -52,6 +52,7 @@ fn mask_arg(arg: &str) -> String {
     let s = mask_embedded_assignments(&s);
     let s = mask_embedded_flag_values(&s);
     let s = mask_header_values(&s);
+    let s = mask_json_values(&s);
     mask_known_prefixes(&s)
 }
 
@@ -275,6 +276,47 @@ fn mask_embedded_flag_values(s: &str) -> String {
         out.push_str(&s[copied..start]);
         out.push_str(MASK);
         copied = end;
+    }
+    out.push_str(&s[copied..]);
+    out
+}
+
+/// Masks the string value of a JSON property whose quoted name contains
+/// key/token/secret/password/auth: `"apiKey":"abc"` becomes `"apiKey":"***"`,
+/// e.g. in `claude --mcp-config '{"mcpServers":{"x":{"env":{"API_KEY":"abc"}}}}'`.
+/// Other values (numbers, objects) are left alone.
+fn mask_json_values(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut copied = 0;
+    let mut resume = 0;
+    for (i, _) in s.match_indices('"') {
+        if i < resume {
+            continue;
+        }
+        let rest = &s[i + 1..];
+        let name_len = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+            .unwrap_or(rest.len());
+        if name_len == 0
+            || !rest[name_len..].starts_with('"')
+            || !has_secret_name(&rest[..name_len])
+        {
+            continue;
+        }
+        let Some(after) = rest[name_len + 1..].trim_start().strip_prefix(':') else {
+            continue;
+        };
+        let Some(value) = after.trim_start().strip_prefix('"') else {
+            continue;
+        };
+        let value_start = s.len() - value.len();
+        let value_len = value.find('"').unwrap_or(value.len());
+        resume = value_start + value_len;
+        if value_len > 0 {
+            out.push_str(&s[copied..value_start]);
+            out.push_str(MASK);
+            copied = resume;
+        }
     }
     out.push_str(&s[copied..]);
     out
@@ -523,6 +565,7 @@ mod tests {
             "X-Api-Key: k1",
             "Authorization: Basic b64",
             "tool --api-key k2 --token --password 'p q'",
+            r#"{"apiKey":"k3"}"#,
         ];
         let once = m(&all);
         assert_eq!(mask_argv(&once), once);
@@ -545,6 +588,27 @@ mod tests {
             "npm run build --key",
             "foo-token bar",
         ] {
+            assert_eq!(m(&[s]), [s]);
+        }
+    }
+
+    // PR review: secrets in JSON passed as one argument (`--mcp-config '{...}'`).
+    #[test]
+    fn masks_secret_json_string_values() {
+        assert_eq!(
+            m(&[
+                "claude",
+                "--mcp-config",
+                r#"{"x":{"env":{"API_KEY":"abc123","MODE":"dev"}}}"#
+            ]),
+            [
+                "claude",
+                "--mcp-config",
+                r#"{"x":{"env":{"API_KEY":"***","MODE":"dev"}}}"#
+            ]
+        );
+        assert_eq!(m(&[r#"{"apiKey" : "s3cr3t"}"#]), [r#"{"apiKey" : "***"}"#]);
+        for s in [r#"{"model":"gpt","n":"1"}"#, r#"{"token":5}"#, r#""key""#] {
             assert_eq!(m(&[s]), [s]);
         }
     }

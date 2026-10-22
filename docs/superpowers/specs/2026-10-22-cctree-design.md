@@ -330,6 +330,7 @@ cctree  每 2 秒更新 · RAM 已用 27/36 GB · swap 2.3 GB · cctree 本身 1
 - 網址裡的帳號密碼（`https://user:pass@`），以及像 token 的網址使用者名稱（`https://<token>@`）。
 - `Bearer` 後面的值。
 - HTTP header 的值，名稱含上述字樣時（`X-Api-Key: 值`、`Authorization: Basic 值`），驗證方式的字（`Basic` 等）保留。
+- JSON 裡名稱含上述字樣的字串值（`"API_KEY":"值"`，例如 `--mcp-config` 帶的整段設定）。
 
 **路徑**：家目錄一律縮寫成 `~`。
 
