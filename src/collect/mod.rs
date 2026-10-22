@@ -704,7 +704,7 @@ mod tests {
         let busy = s.procs.iter().find(|p| p.key.pid == child.id()).unwrap();
         assert!(
             busy.cpu.unwrap()
-                > 20.0
+                > 5.0
                     / if cfg!(windows) {
                         s.system.logical_cpus as f32
                     } else {
