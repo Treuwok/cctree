@@ -35,8 +35,35 @@ const SHELLS: &[&str] = &[
 ];
 
 /// Names (case-insensitive) of system processes that sit above every app, so
-/// they never name one. PIDs 0 and 1 are excluded as well.
+/// they never name one. See [`is_system_root`] for the full rule.
 const SYSTEM_ROOTS: &[&str] = &["launchd", "systemd", "init", "explorer.exe", "services.exe"];
+
+/// Dot-directories under the home directory (without the dot, compared ignoring
+/// ASCII case) that hold tools, caches or settings for many programs, so they
+/// say nothing about which app a process belongs to.
+const GENERIC_DOT_DIRS: &[&str] = &[
+    "local",
+    "cache",
+    "config",
+    "npm",
+    "nvm",
+    "volta",
+    "asdf",
+    "fnm",
+    "cargo",
+    "rustup",
+    "bun",
+    "deno",
+    "pyenv",
+    "rbenv",
+    "nix-profile",
+    "pub-cache",
+    "gradle",
+    "m2",
+    "docker",
+    "orbstack",
+    "vite-plus",
+];
 
 /// File extensions that mark an executable; only these are dropped from a
 /// program name (`python3.12` and `com.apple.Foo` keep their dots).
@@ -182,24 +209,26 @@ impl<'a> Lineage<'a> {
         }
     }
 
-    /// The app that started `k`, or `None` when `k` was started from a shell
-    /// (the user did it, so there is nothing to name) or has no parent.
+    /// The app that started `k`. `None` when `k` has no parent, was started from
+    /// a shell (the user did it), or was started by a system root (see
+    /// [`is_system_root`]): only real apps are worth naming ("started by VS Code").
     pub fn launcher(&self, k: ProcKey) -> Option<String> {
         let parent = &self.snap.procs[self.parent[self.index_of(k)?]?];
-        if is_shell(parent) {
+        if is_shell(parent) || is_system_root(parent) {
             return None;
         }
         Some(app_name(parent, self.snap.home.as_deref()))
     }
 
-    /// The app at the top of `k`'s ancestry: the farthest ancestor that is not
-    /// PID 0 or 1 or a system root (`launchd`, `systemd`, `init`, `explorer.exe`,
-    /// `services.exe`).
+    /// The app at the top of `k`'s ancestry: the farthest ancestor that is
+    /// neither a shell (`login` included) nor a system root (see
+    /// [`is_system_root`]). `None` if every ancestor is one of those.
     pub fn top_app(&self, k: ProcKey) -> Option<String> {
         let mut top = None;
         let mut cur = self.index_of(k)?;
         while let Some(par) = self.parent[cur] {
-            if !is_system_root(&self.snap.procs[par]) {
+            let ancestor = &self.snap.procs[par];
+            if !is_shell(ancestor) && !is_system_root(ancestor) {
                 top = Some(par);
             }
             cur = par;
@@ -222,7 +251,8 @@ impl<'a> Lineage<'a> {
 /// applies winning:
 /// 1. the `X` of the first `X.app` path component (macOS bundles);
 /// 2. the first directory under `home` that starts with `.`, without the dot
-///    (`~/.hermes/venv/bin/python` is "hermes");
+///    (`~/.hermes/venv/bin/python` is "hermes"), unless it is a generic tool or
+///    cache directory such as `.local` or `.nvm`: then rule 3 applies;
 /// 3. the executable's file name without an executable extension;
 /// 4. the process name, if there is no path.
 ///
@@ -308,8 +338,15 @@ fn is_subreaper(p: &RawProc) -> bool {
     systemd_user || wsl_init
 }
 
+/// A process that sits above every app and so never names one: PID 0 or 1, a
+/// subreaper (`systemd --user`, WSL's `/init`), one named in [`SYSTEM_ROOTS`]
+/// (`launchd`, `systemd` with any arguments, `init`, `explorer.exe`,
+/// `services.exe`), or the Windows `System` process (PID 4).
 fn is_system_root(p: &RawProc) -> bool {
-    p.key.pid <= 1 || SYSTEM_ROOTS.iter().any(|r| p.name.eq_ignore_ascii_case(r))
+    p.key.pid <= 1
+        || (p.key.pid == 4 && p.name.eq_ignore_ascii_case("System"))
+        || SYSTEM_ROOTS.iter().any(|r| p.name.eq_ignore_ascii_case(r))
+        || is_subreaper(p)
 }
 
 /// The `X` of the first `X.app` component of `path`.
@@ -319,8 +356,11 @@ fn bundle_name(path: &str) -> Option<&str> {
 }
 
 /// For a `path` under `home`, the name (without its dot) of the first directory
-/// below `home` that starts with `.`. The last component is the file itself and
-/// never counts. `home` matches ignoring ASCII case, since Windows paths do.
+/// below `home` that starts with `.`, unless it is one of [`GENERIC_DOT_DIRS`]:
+/// then there is no answer, and a later dot-directory (`.bin` in
+/// `~/.npm/_npx/x/node_modules/.bin/`) is not looked at either. The last
+/// component is the file itself and never counts. `home` matches ignoring ASCII
+/// case, since Windows paths do.
 fn dot_dir_under<'p>(path: &'p str, home: &str) -> Option<&'p str> {
     let home = home.trim_end_matches(['/', '\\']);
     if home.is_empty() || !path.get(..home.len())?.eq_ignore_ascii_case(home) {
@@ -337,7 +377,10 @@ fn dot_dir_under<'p>(path: &'p str, home: &str) -> Option<&'p str> {
             && !name.is_empty()
             && name != "."
         {
-            return Some(name);
+            let generic = GENERIC_DOT_DIRS
+                .iter()
+                .any(|g| name.eq_ignore_ascii_case(g));
+            return (!generic).then_some(name);
         }
     }
     None
@@ -644,7 +687,6 @@ mod tests {
         );
         // 2. the first dot-directory under home; the file name itself does not count.
         assert_eq!(name(&["/Users/u/.bun/bin/bun"], h), "bun");
-        assert_eq!(name(&["/Users/u/.config/x/.hidden/y"], h), "config");
         assert_eq!(name(&["/Users/u/.hidden"], h), ".hidden");
         assert_eq!(name(&["/Users/u/code/app/.venv/bin/python"], h), "venv");
         assert_eq!(
@@ -653,11 +695,8 @@ mod tests {
         );
         assert_eq!(name(&["~/.hermes/bin/x"], Some("~")), "hermes");
         assert_eq!(
-            name(
-                &["C:\\Users\\u\\.cargo\\bin\\cctree.exe"],
-                Some("c:\\Users\\U")
-            ),
-            "cargo"
+            name(&["C:\\Users\\u\\.hermes\\bin\\x.exe"], Some("c:\\Users\\U")),
+            "hermes"
         );
         // Only real children of home count, never a sibling that shares the prefix.
         assert_eq!(name(&["/Users/uu/.hermes/bin/x"], h), "x");
@@ -682,6 +721,71 @@ mod tests {
         assert_eq!(app_name(&r, h), "svchost");
         r.name = "launchd".into();
         assert_eq!(app_name(&r, h), "launchd");
+    }
+
+    #[test]
+    fn generic_dot_dirs_fall_through_to_the_executable_name() {
+        let h = Some("/Users/u");
+        let name = |argv: &[&str]| app_name(&p(1, 0, 1, argv), h);
+        // Tool and cache directories say nothing about the app.
+        assert_eq!(name(&["/Users/u/.local/bin/claude"]), "claude");
+        assert_eq!(
+            name(&["/Users/u/.local/share/claude/versions/2.1.306"]),
+            "2.1.306"
+        );
+        assert_eq!(name(&["/Users/u/.nvm/versions/node/v24/bin/node"]), "node");
+        assert_eq!(
+            name(&["/Users/u/.npm/_npx/abc/node_modules/.bin/playwright-mcp"]),
+            "playwright-mcp"
+        );
+        assert_eq!(name(&["/Users/u/.config/x/.hidden/y"]), "y");
+        assert_eq!(
+            app_name(
+                &p(1, 0, 1, &["C:\\Users\\u\\.cargo\\bin\\cctree.exe"]),
+                Some("c:\\Users\\U")
+            ),
+            "cctree"
+        );
+        for dir in GENERIC_DOT_DIRS {
+            assert_eq!(
+                name(&[format!("/Users/u/.{dir}/bin/tool").as_str()]),
+                "tool"
+            );
+            assert_eq!(
+                name(&[format!("/Users/u/.{}/bin/tool", dir.to_uppercase()).as_str()]),
+                "tool"
+            );
+        }
+        for dir in [
+            "local",
+            "cache",
+            "config",
+            "npm",
+            "nvm",
+            "volta",
+            "asdf",
+            "fnm",
+            "cargo",
+            "rustup",
+            "bun",
+            "deno",
+            "pyenv",
+            "rbenv",
+            "nix-profile",
+            "pub-cache",
+            "gradle",
+            "m2",
+            "docker",
+            "orbstack",
+            "vite-plus",
+        ] {
+            assert!(GENERIC_DOT_DIRS.contains(&dir), "{dir}");
+        }
+        // App directories still name the app, and so does a longer name that
+        // merely starts like a generic one.
+        assert_eq!(name(&["/Users/u/.hermes/venv/bin/python"]), "hermes");
+        assert_eq!(name(&["/Users/u/.localstack/bin/x"]), "localstack");
+        assert_eq!(name(&["/Users/u/.hermes/node_modules/.bin/x"]), "hermes");
     }
 
     #[test]
@@ -711,9 +815,9 @@ mod tests {
         let s = snap(
             Platform::Windows,
             vec![
-                p(1, 0, 1, &["C:\\Program Files\\Claude\\Claude.exe"]),
-                p(2, 1, 2, &["C:\\Windows\\System32\\cmd.exe"]),
-                p(3, 1, 2, &["claude.exe"]),
+                p(50, 0, 1, &["C:\\Program Files\\Claude\\Claude.exe"]),
+                p(2, 50, 2, &["C:\\Windows\\System32\\cmd.exe"]),
+                p(3, 50, 2, &["claude.exe"]),
                 p(4, 2, 3, &["claude.exe"]),
                 p(5, 99, 3, &["claude.exe"]),
             ],
@@ -722,7 +826,105 @@ mod tests {
         let k = |pid| l.key_of(pid).unwrap();
         assert_eq!(l.launcher(k(3)).as_deref(), Some("Claude"));
         assert_eq!(l.launcher(k(4)), None); // started from cmd.exe
-        assert_eq!(l.launcher(k(1)), None); // no parent
+        assert_eq!(l.launcher(k(50)), None); // no parent
         assert_eq!(l.launcher(k(5)), None); // parent not in the snapshot
+    }
+
+    #[test]
+    fn launcher_is_none_below_system_roots_and_subreapers() {
+        let s = snap(
+            Platform::Linux,
+            vec![
+                p(1, 0, 1, &["/sbin/launchd"]),
+                p(4, 0, 1, &["System"]).name("System"),
+                p(10, 1, 2, &["claude"]),
+                p(500, 1, 2, &["/usr/lib/systemd/systemd", "--user"]),
+                p(11, 500, 3, &["claude"]),
+                p(501, 1, 2, &["/usr/lib/systemd/systemd", "--system"]),
+                p(12, 501, 3, &["claude"]),
+                p(600, 1, 2, &["/init"]),
+                p(13, 600, 3, &["claude"]),
+                p(700, 0, 2, &["C:\\Windows\\explorer.exe"]).name("explorer.exe"),
+                p(14, 700, 3, &["claude.exe"]),
+                p(800, 0, 2, &["C:\\Windows\\System32\\services.exe"]).name("services.exe"),
+                p(15, 800, 3, &["claude.exe"]),
+                p(16, 4, 3, &["claude.exe"]),
+                p(900, 1, 2, &["/sbin/init"]),
+                p(17, 900, 3, &["claude"]),
+                p(
+                    5,
+                    1,
+                    1,
+                    &["/Applications/Visual Studio Code.app/Contents/MacOS/Electron"],
+                ),
+                p(18, 5, 3, &["claude"]),
+            ],
+        );
+        let l = Lineage::build(&s);
+        let k = |pid| l.key_of(pid).unwrap();
+        for pid in [10, 11, 12, 13, 14, 15, 16, 17] {
+            assert_eq!(l.launcher(k(pid)), None, "pid {pid}");
+        }
+        assert_eq!(l.launcher(k(18)).as_deref(), Some("Visual Studio Code"));
+    }
+
+    #[test]
+    fn top_app_skips_login_and_shells() {
+        let s = snap(
+            Platform::MacOs,
+            vec![
+                p(1, 0, 1, &["/sbin/launchd"]),
+                // Terminal-less chain: nothing app-like above node.
+                p(10, 1, 2, &["/usr/bin/login"]),
+                p(11, 10, 3, &["-/bin/zsh"]),
+                p(12, 11, 4, &["/Users/u/.local/bin/node"]),
+                // The same chain below a terminal app.
+                p(
+                    20,
+                    1,
+                    2,
+                    &["/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"],
+                ),
+                p(21, 20, 3, &["/usr/bin/login"]),
+                p(22, 21, 4, &["-/bin/zsh"]),
+                p(23, 22, 5, &["/Users/u/.local/bin/node"]),
+                // A shell above the app does not hide it.
+                p(30, 1, 2, &["/bin/bash"]),
+                p(31, 30, 3, &["/Applications/Orca.app/Contents/MacOS/Orca"]),
+                p(32, 31, 4, &["/bin/zsh"]),
+                p(33, 32, 5, &["node"]),
+            ],
+        );
+        let l = Lineage::build(&s);
+        let k = |pid| l.key_of(pid).unwrap();
+        assert_eq!(l.top_app(k(12)), None);
+        assert_eq!(l.top_app(k(11)), None);
+        assert_eq!(l.top_app(k(23)).as_deref(), Some("Terminal"));
+        assert_eq!(l.top_app(k(22)).as_deref(), Some("Terminal"));
+        assert_eq!(l.top_app(k(33)).as_deref(), Some("Orca"));
+    }
+
+    #[test]
+    fn windows_system_process_is_a_system_root() {
+        let s = snap(
+            Platform::Windows,
+            vec![
+                p(4, 0, 1, &["System"]).name("System"),
+                p(8, 4, 2, &["claude.exe"]),
+                p(9, 8, 3, &["node.exe"]),
+            ],
+        );
+        let l = Lineage::build(&s);
+        let k = |pid| l.key_of(pid).unwrap();
+        assert_eq!(l.launcher(k(8)), None);
+        assert_eq!(l.top_app(k(8)), None);
+        assert_eq!(l.top_app(k(9)).as_deref(), Some("claude"));
+        // Only the Windows process named System: PID 4 elsewhere is an ordinary process.
+        let s = snap(
+            Platform::Linux,
+            vec![p(4, 1, 2, &["/usr/bin/worker"]), p(5, 4, 3, &["x"])],
+        );
+        let l = Lineage::build(&s);
+        assert_eq!(l.launcher(l.key_of(5).unwrap()).as_deref(), Some("worker"));
     }
 }
