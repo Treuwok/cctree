@@ -117,7 +117,7 @@ cctree 是一個終端機介面（TUI）工具，像 `top` 一樣持續更新，
 
 - **Claude Code**：符合下列任一條件。
   - `argv[0]` 的檔名是 `claude` 或 `claude.exe`。
-  - 執行檔路徑符合 `*/claude/versions/*`（原生安裝版）。
+  - 執行檔路徑符合 `*/claude/versions/*`（原生安裝版），**而且** `argv[0]` 的檔名和該執行檔的檔名相同。原生版是 multi-call 執行檔，`ugrep`、`rg` 等輔助指令會從同一個檔案以別的名稱執行，它們不是 session。
   - 是 `node`，且執行的是 `@anthropic-ai/claude-code/cli.js`（npm 安裝版）。
 - **Codex**：符合下列任一條件。
   - 執行檔名稱是 `codex` 或 `codex.exe`，包含 `codex app-server` 這類子命令。
@@ -125,7 +125,7 @@ cctree 是一個終端機介面（TUI）工具，像 `top` 一樣持續更新，
 - **依執行檔判斷歸屬，誰帶起來的只用來標註**：
   - 只要符合上面的特徵，不論是誰帶起來的，都算該工具的 session。終端機、VS Code／Cursor extension、Claude Desktop 內建的 Claude Code、Agent SDK 寫的程式都一樣。
   - 「啟動者」（最近一個不是 shell 的祖先 app）顯示在 session 標籤上，例如「（由 VS Code 啟動）」；從終端機啟動的不另外標註。
-  - 桌面 app 的主程式本身不能被誤認成 CLI，所以要依安裝路徑排除。macOS 排除 `/Applications/*.app/` 內的主程式；Windows 排除 Claude Desktop 等 app 的安裝目錄。Windows 上的實際路徑待實測（§6）。
+  - 桌面 app 的主程式本身不能被誤認成 CLI，所以要依安裝路徑排除。macOS 只排除 `<名稱>.app` **直接位於** `Applications` 資料夾（`/Applications`、`/System/Applications`、`~/Applications`）內的主程式；Claude Desktop 內建的 Claude Code 位於 `~/Library/Application Support/Claude/claude-code/<版本>/`，是真正的 session，不排除。Windows 排除 Claude Desktop 等 app 的安裝目錄，實際路徑待實測（§6）。
 - **巢狀**：
   - 工具 process 的祖先如果也是工具 session，不論是不是同一種工具（例如 Claude Code 透過 plugin 或 Bash 帶起 `codex exec`），都只算在**最外層**的 session 底下，顯示成它的子 session，加總也只算一次。
   - 「Codex」大類另外顯示一列不加總的提示：「另有 N 個 Codex session 在 Claude Code 底下」。反過來也一樣。
@@ -169,20 +169,31 @@ cctree 是一個終端機介面（TUI）工具，像 `top` 一樣持續更新，
 判定規則：
 
 1. **強證據**
-   - 指向的 session 還活著，而這個 process 不在它的樹裡：放進該 session 底下的「已脫離（仍屬於這個 session）」分組，並算進該 session 的加總。
-   - 指向的 session 已經結束：判定為**已失聯**，理由寫「原本屬於 Claude Code session（~/prj/foo），該 session 已結束」。
+   - 指向的 session 還活著，而這個 process 不在它的樹裡：放進該 session 底下的「已脫離（仍屬於這個 session）」分組，並算進該 session 的加總。出現在活著的 session 成員（MCP 成員、其他子程序；不含本體）身上的每一個 session id，都對應到那個 session（session 中途換 id 時，MCP 仍帶舊 id）。
+   - 指向的 session 已經結束（沒有任何活著的成員帶著這個 id）：判定為**已失聯**，理由寫「原本屬於 Claude Code session（~/prj/foo），該 session 已結束」。
 2. **中證據**：`--parent-pid` 指向的 PID 已不存在，或已經不是同一個 process（用啟動時間判斷）時，判定為**已失聯**，理由寫「它記錄的主人 PID N 已不存在」。
 3. **弱證據**：只有在 parent 是 launchd／PID 1（macOS），或 parent 已不存在、未通過驗證（Windows），**而且**當下沒有任何該工具的 session 在執行時，才判定為**疑似失聯**。parent 還活著的（例如上面 Chrome 帶起的 native host）不算。
+
+**確定與疑似**：強、中證據判定為已失聯後，只有同時符合以下全部條件才標「確定」，否則標「疑似」。弱證據一律是「疑似」。
+
+- 它已被收養：parent 是 launchd／PID 1／subreaper，或 parent 已不存在。parent 還活著時，可能是 tmux 這類 cctree 不認得的程式在管它。
+- 它不是 app：執行檔不在 `.app` 套件、`/Applications/`，或（Windows）`Program Files`、`Program Files (x86)`、`WindowsApps` 底下。這些是使用者自己開的程式。
+- 強證據另外要求：沒有任何同工具、啟動時間不晚於它的活著的 session **可能是它的主人**。比對專案只用 `CLAUDE_PROJECT_DIR`：有這個變數時，session 的工作目錄要與它相同或互為上下層才算可能；沒有時（Bash 工具帶起的子 process 不會有，而且 Bash 工具可以 `cd` 到任何地方），任何較早啟動的同工具 session 都可能是主人。
+
+**「確定」和「疑似」只是給人看的提示，不會觸發任何批次動作**（§4.7）。
 
 說明：
 
 - macOS 的一般 GUI app 本來 PPID 就是 1，所以 **PPID = 1 本身不算證據**，只是弱證據的前提條件。
 - Linux 上，「parent 是 launchd／PID 1」這個條件改成「parent 是 PID 1，或是 subreaper（`systemd --user`、WSL 的 `/init`）」。
 - 「已失聯」大類裡，「確定」和「疑似」要用不同標記區分。每一列都要在詳細面板寫出判定理由。
+- 已失聯 process 的子孫，跟著它一起算已失聯。仍在使用中的 process（活著的 session 本體及其祖先、cctree 自己，以及帶著活 session id 的 process）永遠不算已失聯。
 
 **環境變數讀取規則**：只讀目前使用者的 process，每個 process 只在第一次看到時讀一次；只取出允許清單內的變數名稱，其他變數一律不儲存、不顯示。
 
 「不儲存」也包含記憶體。2026-10-22 實測，MCP 子 process 的環境變數裡就有 `CLAUDE_CODE_MESSAGING_TOKEN` 這類機密。sysinfo 會把讀到的完整環境變數一直留在它的 process 快取裡，所以讀環境變數時要用一個**用完就丟的獨立 sysinfo 實例**：取出允許清單內的變數後立刻釋放，主實例永遠不讀環境變數。
+
+**命令列還原**：Node 的 process 若設定 `process.title`，會覆寫自己的參數區，sysinfo 讀到的 `argv[0]` 就變成標題，後面還可能接著環境變數字串。收集時要還原這種改寫過的標題：把標題拆回參數，並丟掉標題後面接著的環境變數字串（否則允許清單以外的環境變數值會被存下來）。
 
 **其他 Node.js**：沒被歸到上面任何一類的 `node`、`npm`、`npx`、`bun`、`deno`，以及 argv 含 `mcp` 的 process，依它最上層的非系統祖先 app 分組，例如「Claude」「Code」「Hermes」。
 
@@ -314,8 +325,9 @@ cctree  每 2 秒更新 · RAM 已用 27/36 GB · swap 2.3 GB · cctree 本身 1
 **遮蔽機密**：命令列一律先遮蔽再顯示，不提供顯示原文的選項。至少要遮蔽以下內容：
 
 - `--api-key`、`--token`、`--password`、`--secret`、`--key` 後面接的值，以及 `--x=值` 形式中名稱含 key／token／secret／password／auth 的值。
+- 參數中任何位置的 `名稱=值`（名稱含上述字樣），不只是 `--x=值`。
 - 常見金鑰前綴：`sk-`、`ctx7sk-`、`ghp_`、`gho_`、`xox`、`AKIA`。
-- 網址裡的帳號密碼（`https://user:pass@`）。
+- 網址裡的帳號密碼（`https://user:pass@`），以及像 token 的網址使用者名稱（`https://<token>@`）。
 - `Bearer` 後面的值。
 
 **路徑**：家目錄一律縮寫成 `~`。
@@ -337,10 +349,11 @@ cctree  每 2 秒更新 · RAM 已用 27/36 GB · swap 2.3 GB · cctree 本身 1
 - `x` 用在分組列：不做任何事，訊息列顯示「這一列是一組 process，要結束整組請按 X」。
 - `X` 用在 process 列：結束該 process 和它所有子孫。子孫依目前 snapshot 中經過驗證的 parent 關係判定。
   - 如果是 session 本體，也包含巢狀的子 session，以及「已脫離（仍屬於這個 session）」的 process。已脫離的在確認視窗中另外列一段。
-- `X` 用在分組列：結束組內所有 process 和它們的子孫。
-  - 例外一：用在「Claude Code」「Codex」「其他 Node.js」這三個**大類**本身時一律擋下，訊息列顯示「這一列是整個分類，範圍太大；請到個別 session 或分組上按 X」。
-    - 原因：大類底下是所有 session，或所有和 AI 工具無關的 node process（包括使用者自己在終端機開的 dev server、其他 app 的 node 服務）。一個 `X` 加一個 `Enter` 就全部結束，風險太高。
-  - 例外二：用在「已失聯」大類時，只結束「確定」的那些，這是刻意設計的批次清理。「疑似」的可能是使用者正在用的 app（例如 `ChatGPT Meetings`），必須個別用 `x` 結束。確認視窗要註明「另有 N 個疑似失聯的沒有包含」。
+- `X` 用在分類列（「Claude Code」「Codex」「已失聯」「其他 Node.js」）：一律擋下，訊息列顯示「這一列是整個分類，範圍太大；請到個別 session 或分組上按 X」。**沒有任何分類層級的批次結束**。
+  - 原因：分類底下是所有 session，或所有和 AI 工具無關的 node process（包括使用者自己在終端機開的 dev server、其他 app 的 node 服務）。一個 `X` 加一個 `Enter` 就全部結束，風險太高。
+  - 已失聯的 process 也一樣，一律從它自己那一列結束。「疑似」的可能是使用者正在用的 app（例如 `ChatGPT Meetings`），就算「確定」，也要使用者看過那一列再決定。
+- `X` 用在其他分組列（session、MCP 總類、單一 MCP、其他子程序、已脫離、Node.js 分組）：結束組內所有 process 和它們的子孫。
+- **看到什麼，就結束什麼**：`X` 結束的是畫面上選取那一列底下畫出來的 process，加上它們沒有被分類追蹤的子 process（沒有被辨識成 session、MCP 等的後代）。畫在別的列底下的 process 一律不動，例如畫在「其他子程序」底下的巢狀 session，或在已脫離的 tmux server 裡啟動的 session，連同它們的子孫都跳過。
 
 **確認視窗**
 
@@ -375,7 +388,8 @@ cctree  每 2 秒更新 · RAM 已用 27/36 GB · swap 2.3 GB · cctree 本身 1
 **會擋下來，並說明原因的情況**
 
 - cctree 自己，以及它的所有祖先（例如執行它的 shell、終端機）。
-- PID 0、1 等系統與核心 process，以及其他使用者的 process（Windows 上是存取被拒）。訊息要建議改用 `sudo cctree`，或以系統管理員身分執行。
+- PID 0、1，以及 root／SYSTEM 擁有的 process，一律擋下，包括用 `sudo cctree` 執行時。
+- 其他使用者的 process（Windows 上是存取被拒）。訊息要建議改用 `sudo cctree`，或以系統管理員身分執行。cctree 以 root 執行時，其他使用者（非 root）的 process 可以結束；Windows 上以系統管理員身分執行並不等於 SYSTEM，所以仍會擋下。
 - 殭屍 process：說明它已經結束、不佔記憶體，要結束它的 parent 才會消失，並顯示 parent 的 PID。
 
 **確認視窗中的警告**
@@ -414,7 +428,7 @@ cctree  每 2 秒更新 · RAM 已用 27/36 GB · swap 2.3 GB · cctree 本身 1
 - **兩層收集**：
   - 每次更新時，全部 process 只列出 PID、PPID、啟動時間這些便宜的資訊，用來判斷哪些是新出現、哪些已經結束。
   - 新出現的 process 才讀一次 argv、exe、cwd 和環境變數，然後快取起來。
-  - **CPU 在第一層一起算**，所有 process 都算。原因（2026-10-22 查 sysinfo 原始碼）：sysinfo 在 Linux 上每次 refresh process，不管有沒有要求 CPU，都會呼叫 `set_time` 把「上次的 CPU 時間」換成這次的值。如果第二層才另外讀 CPU，比較的對象是幾毫秒前第一層剛記下的數字，CPU 會永遠接近 0。而且第一層本來就會讀到算 CPU 需要的資料，一起算幾乎不增加成本。
+  - **CPU 在第一層一起算**，所有 process 都算。CPU = 兩次 snapshot 之間累計 CPU 時間的變化 ÷ 經過的實際時間，不用 sysinfo 自己的 `cpu_usage()`（它第一次的讀數不可靠）。原因（2026-10-22 查 sysinfo 原始碼）：sysinfo 在 Linux 上每次 refresh process，不管有沒有要求 CPU，都會呼叫 `set_time` 把「上次的 CPU 時間」換成這次的值。如果第二層才另外讀 CPU，比較的對象是幾毫秒前第一層剛記下的數字，CPU 會永遠接近 0。而且第一層本來就會讀到算 CPU 需要的資料，一起算幾乎不增加成本。
   - **平台記憶體 API 只對會顯示在畫面上的 process 讀取**，也就是 Claude Code、Codex、已失聯、其他 Node.js 這四類。系統整體數字用全系統的 API 取得。
 - 設定檔只在修改時間改變時重讀；畫面只在資料更新或有輸入時重畫。
 
