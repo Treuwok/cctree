@@ -17,8 +17,10 @@
 
 use std::collections::BTreeMap;
 
+use crate::config::{McpConfigs, McpScope, McpServerConfig};
 use crate::model::{
     MemInfo, MemUnavailable, Pid, Platform, ProcKey, ProcStatus, RawProc, Snapshot, SystemInfo,
+    Tool,
 };
 
 /// Builds a snapshot around `procs`. cctree itself is the (absent) process
@@ -62,6 +64,48 @@ pub fn p(pid: Pid, ppid: Pid, start: u64, argv: &[&str]) -> RawProc {
             ..Default::default()
         }),
     }
+}
+
+/// One user-level Claude Code MCP config: `chrome-cdp`, started as
+/// `npx -y chrome-devtools-mcp@latest`. Pairs with [`base`].
+pub(crate) fn cfgs() -> McpConfigs {
+    McpConfigs {
+        servers: vec![McpServerConfig {
+            tool: Tool::ClaudeCode,
+            name: "chrome-cdp".into(),
+            command: "npx".into(),
+            args: vec!["-y".into(), "chrome-devtools-mcp@latest".into()],
+            scope: McpScope::User,
+        }],
+        problems: vec![],
+    }
+}
+
+/// A macOS process tree with one Claude Code session (pid 200, cwd
+/// `/Users/u/prj/a`) started from a shell. Its direct children:
+///
+/// - 210 `npm exec chrome-devtools-mcp@latest` (matches `chrome-cdp` in
+///   [`cfgs`]) -> 211 the server -> 212 its telemetry watchdog;
+/// - 220 `npm exec @playwright/mcp@latest` (no config) -> 221 the server,
+///   which carries `CLAUDE_CODE_SESSION_ID=S1`;
+/// - 230 a Bash-tool shell `/bin/zsh -c ls`.
+pub(crate) fn base() -> Vec<RawProc> {
+    vec![
+        p(1, 0, 1, &["/sbin/launchd"]),
+        p(100, 1, 10, &["/bin/zsh"]),
+        p(200, 100, 20, &["claude"]).cwd("/Users/u/prj/a"),
+        p(210, 200, 21, &["npm", "exec", "chrome-devtools-mcp@latest"]),
+        p(211, 210, 22, &["chrome-devtools-mcp"]),
+        p(
+            212,
+            211,
+            23,
+            &["node", "/x/telemetry/watchdog/main.js", "--parent-pid=211"],
+        ),
+        p(220, 200, 21, &["npm", "exec", "@playwright/mcp@latest"]),
+        p(221, 220, 22, &["node", "/x/.bin/playwright-mcp"]).env("CLAUDE_CODE_SESSION_ID", "S1"),
+        p(230, 200, 30, &["/bin/zsh", "-c", "ls"]),
+    ]
 }
 
 /// The last path component, splitting on both `/` and `\`.
