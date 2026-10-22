@@ -2,8 +2,11 @@
 name = "cctree"
 version = "0.1.0"
 edition = "2024"
+description = "A TUI that shows the process trees of Claude Code and Codex with CPU and memory, and ends a process safely"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/yenchiugu/cctree"
+homepage = "https://github.com/yenchiugu/cctree"
+readme = "README.md"
 
 [dependencies]
 sysinfo = "0.39.6"
@@ -27,3 +30,8 @@ tempfile = "3.27.0"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
