@@ -49,6 +49,7 @@ fn mask_arg(arg: &str) -> String {
     let s = mask_url_userinfo(arg);
     let s = mask_bearer(&s);
     let s = mask_named_assignment(&s);
+    let s = mask_embedded_assignments(&s);
     mask_known_prefixes(&s)
 }
 
@@ -75,8 +76,20 @@ fn starts_with_secret_prefix(s: &str) -> bool {
     SECRET_PREFIXES.iter().any(|p| s.starts_with(p))
 }
 
+/// Shortest user part (without a password) that is treated as a token, e.g. the
+/// 32-hex public key in a Sentry DSN. `git` or `user` stay readable.
+const TOKEN_LIKE_USER_LEN: usize = 16;
+
+fn is_token_like_user(userinfo: &str) -> bool {
+    userinfo.len() >= TOKEN_LIKE_USER_LEN
+        && userinfo
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 /// `https://user:pass@host` becomes `https://***@host`. A user name alone
-/// (`ssh://git@host`) is left alone unless it looks like a token.
+/// (`ssh://git@host`) is left alone unless it looks like a token (known prefix,
+/// or a long run of `[A-Za-z0-9_-]`).
 fn mask_url_userinfo(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -90,7 +103,10 @@ fn mask_url_userinfo(s: &str) -> String {
         let authority = &rest[..authority_len];
         if let Some(at) = authority.rfind('@') {
             let userinfo = &authority[..at];
-            if userinfo.contains(':') || starts_with_secret_prefix(userinfo) {
+            if userinfo.contains(':')
+                || starts_with_secret_prefix(userinfo)
+                || is_token_like_user(userinfo)
+            {
                 out.push_str(MASK);
                 out.push_str(&authority[at..]);
                 rest = &rest[authority_len..];
@@ -142,7 +158,79 @@ fn ends_with_bearer(arg: &str) -> bool {
         .is_some_and(|w| w.eq_ignore_ascii_case("bearer"))
 }
 
-/// `--github-token=abc` becomes `--github-token=***`.
+/// A `NAME=value` may start at the beginning of the text or right after
+/// whitespace, a quote (`'` `"` `` ` ``), `;`, `&`, `|`, `(` or `?` (URL query).
+fn is_assignment_boundary(before: Option<char>) -> bool {
+    before.is_none_or(|c| {
+        c.is_whitespace() || matches!(c, '\'' | '"' | '`' | ';' | '&' | '|' | '(' | '?')
+    })
+}
+
+/// If `s` starts with `[-]{0,2}NAME=` where `NAME` is `[A-Za-z_][A-Za-z0-9_-]*`
+/// and says it carries a secret, returns the byte length of that head (through `=`).
+fn secret_assignment_head(s: &str) -> Option<usize> {
+    let dashes = s.bytes().take(2).take_while(|&b| b == b'-').count();
+    let name_and_rest = &s[dashes..];
+    let first = name_and_rest.chars().next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    let name_len = name_and_rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .unwrap_or(name_and_rest.len());
+    if !name_and_rest[name_len..].starts_with('=') || !has_secret_name(&name_and_rest[..name_len]) {
+        return None;
+    }
+    Some(dashes + name_len + 1)
+}
+
+/// Returns `(opening quote length, value length)` for the value at the start of `s`.
+/// A quoted value is the quoted content (an unterminated quote runs to the end);
+/// anything else ends at whitespace, a quote, `;`, `&`, `|` or `)`.
+fn assignment_value(s: &str) -> (usize, usize) {
+    match s.chars().next() {
+        Some(quote @ ('\'' | '"')) => (1, s[1..].find(quote).unwrap_or(s.len() - 1)),
+        _ => {
+            let end = s.find(|c: char| {
+                c.is_whitespace() || matches!(c, '\'' | '"' | '`' | ';' | '&' | '|' | ')')
+            });
+            (0, end.unwrap_or(s.len()))
+        }
+    }
+}
+
+/// Masks `NAME=value` anywhere in the text when `NAME` contains key/token/secret/
+/// password/auth, e.g. `export CLAUDE_CODE_MESSAGING_TOKEN=abc && ...` inside a
+/// `sh -c` string, `env GITHUB_TOKEN=abc cmd`, or `?token=abc` in a URL. Quotes
+/// around the value are kept; empty values are left alone.
+fn mask_embedded_assignments(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut copied = 0;
+    let mut resume = 0;
+    for (i, _) in s.char_indices() {
+        if i < resume || !is_assignment_boundary(s[..i].chars().next_back()) {
+            continue;
+        }
+        let Some(head) = secret_assignment_head(&s[i..]) else {
+            continue;
+        };
+        let value_start = i + head;
+        let (quote_len, value_len) = assignment_value(&s[value_start..]);
+        let content_start = value_start + quote_len;
+        resume = content_start + value_len;
+        if value_len > 0 {
+            out.push_str(&s[copied..content_start]);
+            out.push_str(MASK);
+            copied = resume;
+        }
+    }
+    out.push_str(&s[copied..]);
+    out
+}
+
+/// `--github-token=abc` becomes `--github-token=***`. Covers any flag name
+/// (including characters `NAME` does not allow, like `-Dspring.db.password=x`)
+/// and masks the whole rest of the argument.
 fn mask_named_assignment(arg: &str) -> String {
     if arg.starts_with('-')
         && let Some((name, _)) = arg.split_once('=')
@@ -412,5 +500,141 @@ mod tests {
             "-",
         ];
         assert_eq!(m(&v), v);
+    }
+
+    // Recon leak 1 (R-c): `NAME=value` anywhere inside an argument, not only in `--flag=value`.
+    #[test]
+    fn masks_secret_assignments_inside_a_shell_command() {
+        let once = m(&[
+            "/bin/zsh",
+            "-c",
+            "source /x.sh || true && export CLAUDE_CODE_MESSAGING_TOKEN=abc123def \
+             && export CODEX_COMPANION_SESSION_ID='u-1' && eval 'ls'",
+        ]);
+        assert_eq!(
+            once[2],
+            "source /x.sh || true && export CLAUDE_CODE_MESSAGING_TOKEN=*** \
+             && export CODEX_COMPANION_SESSION_ID='u-1' && eval 'ls'"
+        );
+        assert_eq!(mask_argv(&once), once);
+    }
+
+    #[test]
+    fn masks_bare_and_embedded_secret_assignments() {
+        let cases: [(&[&str], &[&str]); 4] = [
+            (
+                &["env", "GITHUB_TOKEN=abc", "node", "x.js"],
+                &["env", "GITHUB_TOKEN=***", "node", "x.js"],
+            ),
+            (
+                &["sh", "-c", "API_KEY=\"abc def\" run"],
+                &["sh", "-c", "API_KEY=\"***\" run"],
+            ),
+            (
+                &["sh", "-c", "X_TOKEN='abc def' run"],
+                &["sh", "-c", "X_TOKEN='***' run"],
+            ),
+            (
+                &["a;X_SECRET=abc;b", "a&&Db-Password=abc&&b", "x|AUTH=abc|y"],
+                &["a;X_SECRET=***;b", "a&&Db-Password=***&&b", "x|AUTH=***|y"],
+            ),
+        ];
+        for (input, expected) in cases {
+            let once = m(input);
+            assert_eq!(once, expected, "input {input:?}");
+            assert_eq!(mask_argv(&once), once, "not idempotent for {input:?}");
+        }
+    }
+
+    #[test]
+    fn masks_secret_assignments_after_each_boundary() {
+        let cases = [
+            ("(X_PASSWORD=abc)", "(X_PASSWORD=***)"),
+            ("'X_KEY=abc'", "'X_KEY=***'"),
+            ("`X_KEY=abc`", "`X_KEY=***`"),
+            ("curl --client-secret=abc x", "curl --client-secret=*** x"),
+            ("curl -token=abc x", "curl -token=*** x"),
+            ("https://h/p?token=abc&y=1", "https://h/p?token=***&y=1"),
+            ("https://h/p?y=1&auth=abc", "https://h/p?y=1&auth=***"),
+            ("X_TOKEN=\"abc def", "X_TOKEN=\"***"),
+            ("X_TOKEN=abc;Y_TOKEN=def", "X_TOKEN=***;Y_TOKEN=***"),
+        ];
+        for (input, expected) in cases {
+            let once = m(&[input]);
+            assert_eq!(once[0], expected, "input {input:?}");
+            assert_eq!(mask_argv(&once), once, "not idempotent for {input:?}");
+        }
+    }
+
+    #[test]
+    fn plain_assignments_and_empty_values_are_kept() {
+        for s in [
+            "PATH=/usr/bin",
+            "--lang=en",
+            "LANG=en_US.UTF-8",
+            "CODEX_COMPANION_SESSION_ID='u-1'",
+            "X_TOKEN=",
+            "X_TOKEN=''",
+            "/x/TOKEN=1",
+            "a.TOKEN=1",
+        ] {
+            assert_eq!(m(&[s]), [s], "input {s:?}");
+        }
+    }
+
+    // Recon leak 2 (R-d): URL user part without `:` that looks like a token (Sentry DSN key).
+    #[test]
+    fn masks_token_like_url_user() {
+        let once = m(&["--url=https://0123456789abcdef0123456789abcdef@o1.ingest.sentry.io/2"]);
+        assert_eq!(once, ["--url=https://***@o1.ingest.sentry.io/2"]);
+        assert_eq!(mask_argv(&once), once);
+        assert_eq!(
+            m(&[
+                "https://abcdefghijklmnop@h/x",
+                "https://A_b-C_d-E_f-G_h-@h/x"
+            ]),
+            ["https://***@h/x", "https://***@h/x"]
+        );
+    }
+
+    // Every short combination of the rules' building blocks must neither panic
+    // (byte slicing on non-ASCII text) nor change when masked a second time.
+    #[test]
+    fn small_inputs_never_panic_and_are_idempotent() {
+        let atoms = [
+            "--", "=", "'", "\"", " ", ": ", "@", "://", "&", "?", ";", "(", "TOKEN", "sk-",
+            "ghp_", "Bearer", "日",
+        ];
+        let mut inputs = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for prefix in &frontier {
+                for atom in atoms {
+                    next.push(format!("{prefix}{atom}"));
+                }
+            }
+            inputs.extend(next.iter().cloned());
+            frontier = next;
+        }
+        for input in inputs {
+            let once = mask_argv(std::slice::from_ref(&input));
+            assert_eq!(mask_argv(&once), once, "not idempotent for {input:?}");
+            let pair = mask_argv(&[input.clone(), input.clone()]);
+            assert_eq!(mask_argv(&pair), pair, "not idempotent for pair {input:?}");
+        }
+    }
+
+    #[test]
+    fn short_or_plain_url_users_are_kept() {
+        for s in [
+            "git@github.com:o/r.git",
+            "ssh://git@host/x",
+            "https://user@host/x",
+            "https://abcdefghijklmno@h/x",
+            "https://first.last.name.long@h/x",
+        ] {
+            assert_eq!(m(&[s]), [s], "input {s:?}");
+        }
     }
 }
