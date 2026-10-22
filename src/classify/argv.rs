@@ -217,8 +217,9 @@ pub fn mcp_fallback_name(argv: &[String]) -> String {
 }
 
 /// Whether `p` only exists to start another program, so the tree should look
-/// through it: `npm exec ...`, `npx`, `cmd(.exe) /c ...`, and the console hosts
-/// `conhost.exe` and `OpenConsole.exe`.
+/// through it: `npm exec ...`, `npx`, `cmd(.exe) /c ...`, the console hosts
+/// `conhost.exe` and `OpenConsole.exe`, and (Windows, where `npx.cmd` runs the
+/// scripts through `node`) `node .../npx-cli.js` and `node .../npm-cli.js exec`.
 pub fn is_wrapper(p: &RawProc) -> bool {
     let name = base_name(&p.name);
     let program = p
@@ -237,6 +238,20 @@ pub fn is_wrapper(p: &RawProc) -> bool {
     }
     if is(program, "npx") {
         return true;
+    }
+    if is(program, "node") {
+        let args = p.argv.get(1..).unwrap_or_default();
+        if let Some(script) = script_arg("node", args) {
+            let file = file_name(script);
+            let next = args
+                .iter()
+                .position(|a| a == script)
+                .and_then(|i| args.get(i + 1));
+            return file.eq_ignore_ascii_case("npx-cli.js")
+                || (file.eq_ignore_ascii_case("npm-cli.js")
+                    && next.is_some_and(|a| a.eq_ignore_ascii_case("exec")));
+        }
+        return false;
     }
     if is(program, "npm") {
         return p
@@ -953,6 +968,13 @@ mod tests {
             &["C:\\Windows\\System32\\OpenConsole.exe", "--headless"],
             &["conhost.exe", "0x4"],
             &["npm", "EXEC", "x"],
+            &[
+                "C:\\nodejs\\node.exe",
+                "C:\\n\\bin\\npx-cli.js",
+                "-y",
+                "pkg",
+            ],
+            &["node", "/n/bin/npm-cli.js", "exec", "pkg"],
         ] {
             assert!(is_wrapper(&p(1, 0, 1, yes)), "{yes:?}");
         }
@@ -962,6 +984,7 @@ mod tests {
             &["cmd.exe"],
             &["cmd.exe", "/k", "dir"],
             &["node", "x.js"],
+            &["node", "/n/bin/npm-cli.js", "install"],
             &["/bin/zsh", "-c", "ls"],
             &["conhost-helper"],
         ] {

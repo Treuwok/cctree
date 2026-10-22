@@ -732,9 +732,19 @@ mod tests {
                     &["cmd.exe", "/c", "npx", "-y", "@playwright/mcp"],
                 ),
                 p(21, 20, 3, &[r"C:\Windows\System32\conhost.exe", "0x4"]),
-                p(22, 20, 3, &[r"C:\nodejs\node.exe", r"C:\x\cli.js"]),
+                p(
+                    22,
+                    20,
+                    3,
+                    &[
+                        r"C:\nodejs\node.exe",
+                        r"C:\nodejs\node_modules\npm\bin\npx-cli.js",
+                        "-y",
+                        "@playwright/mcp",
+                    ],
+                ),
                 p(23, 22, 4, &["cmd.exe", "/d", "/s", "/c", "playwright-mcp"]),
-                p(24, 23, 5, &[r"C:\nodejs\node.exe", r"C:\x\other.js"]),
+                p(24, 23, 5, &[r"C:\nodejs\node.exe", r"C:\x\cli.js"]),
             ],
         );
         let c = classify(&s, &McpConfigs::default());
@@ -748,11 +758,15 @@ mod tests {
             [
                 Some(McpPart::Wrapper),
                 Some(McpPart::Wrapper),
-                Some(McpPart::Server),
                 Some(McpPart::Wrapper),
-                Some(McpPart::Helper),
+                Some(McpPart::Wrapper),
+                Some(McpPart::Server),
             ]
         );
+        // The MCP row shows the real server, not `node npx-cli.js`.
+        let rows = crate::tree::build_tree(&s, &c, crate::tree::ViewMode::BySession);
+        let row = crate::tree::find(&rows, &crate::tree::NodeId::Mcp(k(20))).unwrap();
+        assert_eq!(row.pid, Some(24));
     }
 
     #[test]
