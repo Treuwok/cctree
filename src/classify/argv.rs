@@ -921,7 +921,7 @@ mod tests {
             "LOGNAME=u",
             "PATH=/usr/bin:/bin",
         ]);
-        let argv = crate::collect::normalize_argv(raw);
+        let argv = crate::collect::normalize_argv(raw, Some("/usr/local/bin/node"));
         let proc_ = p(
             1,
             0,

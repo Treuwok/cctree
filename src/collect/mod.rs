@@ -69,26 +69,49 @@ fn cpu_percent(prev_ms: u64, now_ms: u64, elapsed: Duration) -> f32 {
 /// Undoes a rewritten process title.
 ///
 /// A Node process that sets `process.title` (`npm exec pkg --flag`) overwrites
-/// its argument area. sysinfo then reports the whole title as `argv[0]`, and the
+/// its argument area. sysinfo then reports the title as `argv[0]`, and the
 /// "arguments" after it are whatever follows in memory: the environment
 /// strings (`HOME=...`, `CLAUDE_CODE_MESSAGING_TOKEN=...`) on macOS, empty
 /// strings on Linux. Keeping those would store environment values that
 /// [`ENV_ALLOWLIST`](crate::model::ENV_ALLOWLIST) was meant to drop (spec 4.3).
 ///
-/// If `raw[0]` contains whitespace and every later element is empty or looks
-/// like `NAME=...`, the result is the whitespace-separated words of `raw[0]`.
-/// Anything else is returned unchanged.
-pub fn normalize_argv(raw: Vec<String>) -> Vec<String> {
+/// Both rules need every element after `raw[0]` to be empty or to look like
+/// `NAME=...`; otherwise `raw` is returned unchanged.
+/// * A: `raw[0]` contains whitespace (a title of several words). The result is
+///   its whitespace-separated words.
+/// * B: `raw[0]` is one word, at least one element follows, and the executable
+///   `exe` is known and has another file name (ignoring case, `.exe` and the
+///   directory) than `raw[0]` (`chrome-devtools-mcp` running as `node`). The
+///   result is `raw[0]` alone. When the names agree (`env FOO=1`) the
+///   arguments are real and stay.
+pub fn normalize_argv(raw: Vec<String>, exe: Option<&str>) -> Vec<String> {
     let Some((first, rest)) = raw.split_first() else {
         return raw;
     };
-    if !first.contains(|c: char| c.is_ascii_whitespace())
-        || !rest.iter().all(|a| a.is_empty() || is_env_like(a))
-    {
+    if !rest.iter().all(|a| a.is_empty() || is_env_like(a)) {
         return raw;
     }
-    let words: Vec<String> = first.split_ascii_whitespace().map(str::to_string).collect();
-    if words.is_empty() { raw } else { words }
+    if first.contains(|c: char| c.is_ascii_whitespace()) {
+        let words: Vec<String> = first.split_ascii_whitespace().map(str::to_string).collect();
+        return if words.is_empty() { raw } else { words };
+    }
+    let retitled = !first.is_empty()
+        && !rest.is_empty()
+        && exe.is_some_and(|e| !program_stem(e).eq_ignore_ascii_case(program_stem(first)));
+    if retitled { vec![first.clone()] } else { raw }
+}
+
+/// The file name of `path` (split on `/` and `\`) without a trailing `.exe`.
+fn program_stem(path: &str) -> &str {
+    let file = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    match file
+        .len()
+        .checked_sub(4)
+        .and_then(|at| Some((at, file.get(at..)?)))
+    {
+        Some((at, ext)) if at > 0 && ext.eq_ignore_ascii_case(".exe") => &file[..at],
+        _ => file,
+    }
 }
 
 /// Whether `s` starts with `NAME=`, where `NAME` is `[A-Za-z_][A-Za-z0-9_]*`.
@@ -204,17 +227,20 @@ impl Collector {
         let mut env_cwd = read_env_and_cwd(&wanted);
         for (key, p) in &new {
             let (env, cwd) = env_cwd.remove(&p.pid()).unwrap_or_default();
+            let exe = p.exe().map(|e| e.to_string_lossy().into_owned());
+            let argv = normalize_argv(
+                p.cmd()
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect(),
+                exe.as_deref(),
+            );
             self.statics.insert(
                 *key,
                 StaticInfo {
                     name: p.name().to_string_lossy().into_owned(),
-                    exe: p.exe().map(|e| e.to_string_lossy().into_owned()),
-                    argv: normalize_argv(
-                        p.cmd()
-                            .iter()
-                            .map(|a| a.to_string_lossy().into_owned())
-                            .collect(),
-                    ),
+                    exe,
+                    argv,
                     cwd,
                     env,
                     is_own_user: is_own_user(p, own_uid),
@@ -441,7 +467,7 @@ mod tests {
             "EMPTY=",
         ]);
         assert_eq!(
-            normalize_argv(macos),
+            normalize_argv(macos, None),
             strings(&[
                 "npm",
                 "exec",
@@ -452,12 +478,18 @@ mod tests {
         );
         // Linux: the area after the title is empty strings.
         assert_eq!(
-            normalize_argv(strings(&["npm exec @playwright/mcp@latest", "", ""])),
+            normalize_argv(strings(&["npm exec @playwright/mcp@latest", "", ""]), None),
             strings(&["npm", "exec", "@playwright/mcp@latest"])
         );
         // A lone argv[0] with whitespace is split too.
-        assert_eq!(normalize_argv(strings(&["a b"])), strings(&["a", "b"]));
-        assert_eq!(normalize_argv(strings(&["a \t b"])), strings(&["a", "b"]));
+        assert_eq!(
+            normalize_argv(strings(&["a b"]), None),
+            strings(&["a", "b"])
+        );
+        assert_eq!(
+            normalize_argv(strings(&["a \t b"]), None),
+            strings(&["a", "b"])
+        );
     }
 
     #[test]
@@ -483,9 +515,74 @@ mod tests {
             &[""],
             &["   "],
         ] {
-            assert_eq!(normalize_argv(strings(argv)), strings(argv), "{argv:?}");
+            assert_eq!(
+                normalize_argv(strings(argv), None),
+                strings(argv),
+                "{argv:?}"
+            );
         }
-        assert_eq!(normalize_argv(Vec::new()), Vec::<String>::new());
+        assert_eq!(normalize_argv(Vec::new(), None), Vec::<String>::new());
+    }
+
+    #[test]
+    fn normalize_argv_drops_the_environ_behind_a_one_word_title() {
+        // macOS: a single-word title (`chrome-devtools-mcp`) is followed by
+        // environment strings, and the real executable is `node`.
+        let title = strings(&[
+            "chrome-devtools-mcp",
+            "NVM_INC=/x",
+            "CLAUDE_CODE_MESSAGING_TOKEN=abc",
+        ]);
+        let node = Some("/Users/u/.nvm/versions/node/v22/bin/node");
+        assert_eq!(
+            normalize_argv(title.clone(), node),
+            strings(&["chrome-devtools-mcp"])
+        );
+        // Windows: separators and `.exe` do not matter.
+        assert_eq!(
+            normalize_argv(
+                strings(&["chrome-devtools-mcp", "A=1"]),
+                Some("C:\\nodejs\\node.exe")
+            ),
+            strings(&["chrome-devtools-mcp"])
+        );
+        // Linux: the tail is empty strings.
+        assert_eq!(
+            normalize_argv(strings(&["chrome-devtools-mcp", "", ""]), node),
+            strings(&["chrome-devtools-mcp"])
+        );
+        // Rule A does not look at the executable.
+        assert_eq!(
+            normalize_argv(strings(&["npm exec x", "A=1"]), node),
+            strings(&["npm", "exec", "x"])
+        );
+        // Without an executable there is nothing to compare with.
+        assert_eq!(normalize_argv(title.clone(), None), title);
+    }
+
+    #[test]
+    fn normalize_argv_keeps_real_environment_arguments() {
+        for (argv, exe) in [
+            // Same program: these really are the arguments.
+            (&["env", "FOO=1"][..], Some("/usr/bin/env")),
+            (&["node", "A=1"], Some("/usr/local/bin/node")),
+            (&["NODE", "A=1"], Some("C:\\nodejs\\node.exe")),
+            (&["node.exe", "A=1"], Some("/usr/local/bin/node")),
+            // Executable unknown.
+            (&["x", "A=1"], None),
+            // Not all env-like.
+            (&["x", "A=1", "--flag"], Some("/bin/y")),
+            (&["x", "plain"], Some("/bin/y")),
+            // Nothing after argv[0], or nothing to name.
+            (&["x"], Some("/bin/y")),
+            (&["", "A=1"], Some("/bin/y")),
+        ] {
+            assert_eq!(
+                normalize_argv(strings(argv), exe),
+                strings(argv),
+                "{argv:?} {exe:?}"
+            );
+        }
     }
 
     /// Kills the child when dropped, so a failing assertion cannot leave a
