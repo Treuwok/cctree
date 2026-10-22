@@ -17,11 +17,21 @@
 //!   - on the orphan category: only the [`Certainty::Confirmed`] orphan roots
 //!     and their descendants; `excluded_suspected` counts the suspected roots.
 //!
-//!   Whenever a session root is ended, so are the processes detached from
-//!   that session ([`Role::Detached`]) and their descendants. This covers
-//!   `X` on a session (spec: it includes the processes detached from it) and,
-//!   by the same token, the nested sessions ended with it, so the plan
-//!   matches what the row adds up to.
+//!   Two rules bound what the walk down the descendants takes in:
+//!   - **Detached processes** ([`Role::Detached`]) and their descendants
+//!     come along only for `X` on a session's own row: those of that session
+//!     and of every session drawn under it (nested in it through `outer`), as
+//!     the row shows them. `X` on any other row (a group, a plain process)
+//!     never takes a detached process the row does not show, even when it
+//!     ends a nested session as a descendant.
+//!   - **Sessions not drawn under the row stop the walk**: a session root
+//!     reached by the walk is ended (with its subtree) only if it belongs
+//!     under the row's own sessions (the anchors: a session row's root; the
+//!     session a member, other child or detached process belongs to; none for
+//!     orphans and other Node.js), i.e. it is an anchor or nested in one.
+//!     Otherwise it and its whole subtree are left out: a top-level session
+//!     the user started in a tmux server that is detached from the session
+//!     being ended, or one a Node.js tool started.
 //! - **Left out**: zombies within an `X` (they have already ended), and keys
 //!   that are no longer in the snapshot.
 //! - **Order**: deepest first. A target's depth is the number of targets
@@ -29,17 +39,24 @@
 //!   of its session's root. Ties go by key (PID, then start time), so the
 //!   subject's root comes last.
 //! - **Refusals**, checked in this order:
-//!   1. any target is cctree itself ([`Snapshot::self_key`]) or one of its
-//!      lineage ancestors (the shell, the terminal, a session cctree runs in):
-//!      [`KillRefusal::SelfOrAncestor`];
+//!   1. any target is cctree itself or one of its ancestors (the shell, the
+//!      terminal, a session cctree runs in): [`KillRefusal::SelfOrAncestor`].
+//!      cctree is [`Snapshot::self_key`] and also whatever process has its
+//!      PID (should the start time differ); its ancestors are those of the
+//!      lineage and those of the recorded `ppid` chain, where the lineage
+//!      dropped a link;
 //!   2. `x` on a zombie: [`KillRefusal::Zombie`] (also `X` on a zombie whose
 //!      tree has nothing else to end, which says more than "nothing to
 //!      kill"). It comes before the next two: a zombie needs no ending, so
 //!      suggesting `sudo` would be wrong;
 //!   3. any target is PID 0 or 1, or runs as root / SYSTEM:
 //!      [`KillRefusal::System`] (the first one in kill order);
-//!   4. any target belongs to another user: [`KillRefusal::OtherUser`];
-//!   5. no target at all (an unknown or stale row, a note row, an empty
+//!   4. any target belongs to another user, unless cctree itself runs as
+//!      root (`sudo cctree`; unknown counts as not root):
+//!      [`KillRefusal::OtherUser`];
+//!   5. `X` on the orphan category when every orphan is only suspected:
+//!      [`KillRefusal::OnlySuspected`];
+//!   6. no target at all (an unknown or stale row, a note row, an empty
 //!      group): [`KillRefusal::NothingToKill`].
 //!
 //!   One refused target refuses the whole plan: the user is told why and can
@@ -56,8 +73,11 @@
 //!
 //! - cctree knows itself only through [`Snapshot::self_key`], which the
 //!   collector sets (tests set it too); `std::process::id()` is not
-//!   consulted. If cctree is missing from the snapshot, its ancestors are
+//!   consulted. If no process in the snapshot has its PID, its ancestors are
 //!   unknown and only the key itself is protected.
+//! - "Runs as root" is the `is_root_user` of cctree's own process. An
+//!   elevated Windows administrator is not SYSTEM, so there another user's
+//!   processes stay refused (the OS would deny most of them anyway).
 //! - A zombie's `parent` is the PID that has to reap it. On macOS and Linux
 //!   that is the recorded `ppid` (the kernel's answer, also when the lineage
 //!   dropped the link because the parent, a subreaper, started later), as
@@ -69,7 +89,8 @@
 //!   cuts such a loop instead of going round it.
 //!
 //! Building a plan is linear in the number of processes plus a sort of the
-//! targets; no recursion, so any depth of process tree is fine.
+//! targets (plus an `outer` walk per session reached); no recursion, so any
+//! depth of process tree is fine.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -158,6 +179,10 @@ pub enum KillRefusal {
         parent: Option<Pid>,
     },
     NothingToKill,
+    /// `X` on the orphan category, which holds only suspected orphans (`n`).
+    OnlySuspected {
+        n: usize,
+    },
     /// `X` on a whole category other than the orphans.
     CategoryTooBroad,
 }
@@ -204,6 +229,9 @@ pub fn plan_kill(
                     _ => {}
                 }
             }
+            if seeds.is_empty() && suspected > 0 {
+                return Err(KillRefusal::OnlySuspected { n: suspected });
+            }
             ctx.tree(id, &seeds, suspected)
         }
         (_, KillScope::Tree) => ctx.tree(id, &member_keys(node), 0),
@@ -216,6 +244,8 @@ struct Ctx<'a> {
     cls: &'a Classification,
     l: Lineage<'a>,
     by_key: HashMap<ProcKey, &'a RawProc>,
+    /// The `outer` of every session, by root.
+    outer: HashMap<ProcKey, Option<ProcKey>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -225,6 +255,7 @@ impl<'a> Ctx<'a> {
             cls,
             l: Lineage::build(snap),
             by_key: snap.procs.iter().map(|p| (p.key, p)).collect(),
+            outer: cls.sessions.iter().map(|s| (s.root, s.outer)).collect(),
         }
     }
 
@@ -235,20 +266,27 @@ impl<'a> Ctx<'a> {
         if p.status == ProcStatus::Zombie {
             return Err(self.zombie(p));
         }
-        refuse_owner(&[p])?;
+        refuse_owner(&[p], self.self_is_root())?;
         Ok(self.plan(subject, vec![k], 0))
     }
 
-    /// `X`: `seeds`, their descendants and, for every session root among
-    /// them, its detached processes; zombies left out.
+    /// `X`: see [`Ctx::closure`]; zombies left out.
     fn tree(
         &self,
         subject: &NodeId,
         seeds: &[ProcKey],
         excluded_suspected: usize,
     ) -> Result<KillPlan, KillRefusal> {
+        // The sessions the row belongs to: a session below the row may be
+        // ended only if it is drawn under one of them.
+        let anchors: HashSet<ProcKey> = seeds.iter().filter_map(|&k| self.owner(k)).collect();
+        // Only a session's own row takes detached processes along.
+        let session_row = match subject {
+            NodeId::Proc(k) if *self.cls.role(*k) == Role::SessionRoot => Some(*k),
+            _ => None,
+        };
         let keys: Vec<ProcKey> = self
-            .closure(seeds)
+            .closure(seeds, &anchors, session_row)
             .into_iter()
             .filter(|k| self.by_key[k].status != ProcStatus::Zombie)
             .collect();
@@ -265,14 +303,53 @@ impl<'a> Ctx<'a> {
         let ordered = kill_order(&self.l, self.cls, &keys);
         self.refuse_self(&ordered)?;
         let procs: Vec<&RawProc> = ordered.iter().map(|k| self.by_key[k]).collect();
-        refuse_owner(&procs)?;
+        refuse_owner(&procs, self.self_is_root())?;
         Ok(self.plan(subject, ordered, excluded_suspected))
     }
 
+    /// The session `k` belongs to: itself for a session root, the session
+    /// named by its role for a member or a detached process.
+    fn owner(&self, k: ProcKey) -> Option<ProcKey> {
+        match self.cls.role(k) {
+            Role::SessionRoot => Some(k),
+            Role::Mcp { session, .. }
+            | Role::OtherChild { session }
+            | Role::Detached { session } => Some(*session),
+            Role::Orphan { .. }
+            | Role::OrphanMember { .. }
+            | Role::OtherNode { .. }
+            | Role::Unrelated => None,
+        }
+    }
+
+    /// The session rooted at `s` is one of `tops`, or nested (through its
+    /// `outer` chain) in one of them.
+    fn drawn_under(&self, s: ProcKey, tops: &HashSet<ProcKey>) -> bool {
+        let mut cur = Some(s);
+        // `outer` names an ancestor, so the chain ends; the bound only guards
+        // a hand-made, cyclic classification.
+        for _ in 0..=self.outer.len() {
+            let Some(c) = cur else { return false };
+            if tops.contains(&c) {
+                return true;
+            }
+            cur = self.outer.get(&c).copied().flatten();
+        }
+        false
+    }
+
     /// Every key reachable from `seeds`, each once and only if it is in the
-    /// snapshot, through lineage children and from a session root to its
-    /// detached processes.
-    fn closure(&self, seeds: &[ProcKey]) -> Vec<ProcKey> {
+    /// snapshot, through lineage children. A session root that is not drawn
+    /// under one of `anchors` stops the walk: it and its subtree are left
+    /// out. When the row is the session `session_row`, the processes detached
+    /// from it or from a session drawn under it come along too.
+    fn closure(
+        &self,
+        seeds: &[ProcKey],
+        anchors: &HashSet<ProcKey>,
+        session_row: Option<ProcKey>,
+    ) -> Vec<ProcKey> {
+        let row: HashSet<ProcKey> = session_row.into_iter().collect();
         let mut detached_of: Option<HashMap<ProcKey, Vec<ProcKey>>> = None;
         let mut seen: HashSet<ProcKey> = HashSet::new();
         let mut out = Vec::new();
@@ -281,9 +358,13 @@ impl<'a> Ctx<'a> {
             if !self.by_key.contains_key(&k) || !seen.insert(k) {
                 continue;
             }
+            let session = *self.cls.role(k) == Role::SessionRoot;
+            if session && !self.drawn_under(k, anchors) {
+                continue;
+            }
             out.push(k);
             stack.extend(self.l.children(k).iter().rev());
-            if *self.cls.role(k) == Role::SessionRoot {
+            if session && self.drawn_under(k, &row) {
                 let of = detached_of.get_or_insert_with(|| self.detached_by_session());
                 if let Some(d) = of.get(&k) {
                     stack.extend(d.iter().rev());
@@ -307,13 +388,41 @@ impl<'a> Ctx<'a> {
 
     /// cctree and its ancestors are never ended.
     fn refuse_self(&self, keys: &[ProcKey]) -> Result<(), KillRefusal> {
-        let me = self.snap.self_key;
-        let mut protected: HashSet<ProcKey> = self.l.ancestors(me).into_iter().collect();
-        protected.insert(me);
+        let protected = self.protected();
         if keys.iter().any(|k| protected.contains(k)) {
             return Err(KillRefusal::SelfOrAncestor);
         }
         Ok(())
+    }
+
+    /// cctree ([`Snapshot::self_key`], and whatever process has its PID, in
+    /// case the start time differs), with the ancestors of each through the
+    /// lineage and through the recorded `ppid` (where the lineage dropped a
+    /// link).
+    fn protected(&self) -> HashSet<ProcKey> {
+        let me = self.snap.self_key;
+        let mut out = HashSet::from([me]);
+        for start in [Some(me), self.l.key_of(me.pid)].into_iter().flatten() {
+            out.insert(start);
+            out.extend(self.l.ancestors(start));
+            let mut walked: HashSet<ProcKey> = HashSet::new();
+            let mut cur = self.by_key.get(&start).and_then(|p| p.ppid);
+            while let Some(k) = cur.and_then(|pid| self.l.key_of(pid)) {
+                if !walked.insert(k) {
+                    break;
+                }
+                out.insert(k);
+                cur = self.by_key.get(&k).and_then(|p| p.ppid);
+            }
+        }
+        out
+    }
+
+    /// cctree runs as root (`sudo cctree`); unknown counts as not.
+    fn self_is_root(&self) -> bool {
+        self.by_key
+            .get(&self.snap.self_key)
+            .is_some_and(|p| p.is_root_user)
     }
 
     fn zombie(&self, p: &RawProc) -> KillRefusal {
@@ -390,13 +499,13 @@ impl<'a> Ctx<'a> {
     }
 }
 
-/// System and other users' processes are refused; the first one in `procs`
-/// is named.
-fn refuse_owner(procs: &[&RawProc]) -> Result<(), KillRefusal> {
+/// System processes are refused, and so are other users' unless cctree runs
+/// as root; the first one in `procs` is named.
+fn refuse_owner(procs: &[&RawProc], self_is_root: bool) -> Result<(), KillRefusal> {
     if let Some(p) = procs.iter().find(|p| p.key.pid <= 1 || p.is_root_user) {
         return Err(KillRefusal::System { pid: p.key.pid });
     }
-    if let Some(p) = procs.iter().find(|p| !p.is_own_user) {
+    if !self_is_root && let Some(p) = procs.iter().find(|p| !p.is_own_user) {
         return Err(KillRefusal::OtherUser { pid: p.key.pid });
     }
     Ok(())
@@ -967,10 +1076,16 @@ mod tests {
     }
 
     #[test]
-    fn only_suspected_orphans_leave_nothing_to_kill() {
+    fn only_suspected_orphans_are_refused_as_such() {
         let mut v = base();
         // Started after session 200 with no project: 200 could own it.
         v.push(p(401, 1, 70, &["node", "x"]).env(SID, "GONE"));
+        v.push(p(
+            80871,
+            1,
+            5,
+            &["/private/var/folders/x/T/codex-home-Z/r/ChatGPT Meetings"],
+        ));
         let (s, c, t) = setup(v, Platform::MacOs);
         assert_eq!(
             plan_kill(
@@ -980,7 +1095,7 @@ mod tests {
                 &NodeId::Category(Category::Orphaned),
                 KillScope::Tree
             ),
-            Err(KillRefusal::NothingToKill)
+            Err(KillRefusal::OnlySuspected { n: 2 })
         );
         // Ended one at a time, it is fine.
         let k = s.index()[&401].key;
@@ -1152,5 +1267,161 @@ mod tests {
         let pl = plan_kill(&s, &c, &t, &NodeId::Proc(k), KillScope::Tree).unwrap();
         let want: Vec<Pid> = (200..200 + depth).rev().collect();
         assert_eq!(pids(&pl), want);
+    }
+
+    // ---- Fix round 1 ----
+
+    /// [`base`] plus a Claude Code session 300 nested in 200 (started from
+    /// the Bash-tool shell 230), known by the id `N1` its child 301 carries,
+    /// and a dev server 450 detached from 300.
+    fn nested_with_detached() -> Vec<RawProc> {
+        let mut v = base();
+        v.extend([
+            p(300, 230, 40, &["claude"]).cwd("/Users/u/prj/n"),
+            p(301, 300, 41, &["/bin/zsh", "-c", "npm run dev"]).env(SID, "N1"),
+            p(450, 1, 75, &["node", "dev.js"]).env(SID, "N1"),
+        ]);
+        v
+    }
+
+    #[test]
+    fn only_a_session_row_takes_detached_processes_along() {
+        let (s, c, t) = setup(nested_with_detached(), Platform::MacOs);
+        let k = |pid| s.index()[&pid].key;
+        assert_eq!(c.role(k(450)), &Role::Detached { session: k(300) });
+        assert_eq!(c.session(k(300)).and_then(|x| x.outer), Some(k(200)));
+        let plan = |id: NodeId| pids(&plan_kill(&s, &c, &t, &id, KillScope::Tree).unwrap());
+        // (a) X on the outer session's row: the nested session is drawn under
+        // it, and so is the process detached from the nested session.
+        let all = plan(NodeId::Proc(k(200)));
+        assert!(all.contains(&300) && all.contains(&301) && all.contains(&450));
+        assert_eq!(all.last(), Some(&200));
+        assert!(plan(NodeId::Proc(k(300))).contains(&450));
+        // (b) X on a group row or a plain process row: the nested session is a
+        // descendant and goes, the process detached from it stays.
+        for id in [NodeId::OtherChildren(k(200)), NodeId::Proc(k(230))] {
+            let got = plan(id.clone());
+            assert!(got.contains(&300) && got.contains(&301), "{id:?}");
+            assert!(!got.contains(&450), "{id:?}");
+        }
+    }
+
+    #[test]
+    fn a_session_not_drawn_under_the_row_stops_the_walk() {
+        let mut v = base();
+        v.extend([
+            // A tmux server started from session 200 (it carries 200's id)...
+            p(600, 1, 50, &["tmux", "new", "-d"]).env(SID, "S1"),
+            p(601, 600, 51, &["-zsh"]),
+            // ...where the user later started a session of their own.
+            p(602, 601, 52, &["claude"]).cwd("/Users/u/prj/f"),
+            p(603, 602, 53, &["/bin/zsh", "-c", "ls"]),
+            // A Node.js tool that started a session of its own.
+            p(500, 1, 90, &["node", "tool.js"]),
+            p(501, 500, 91, &["claude"]).cwd("/Users/u/prj/g"),
+        ]);
+        let (s, c, t) = setup(v, Platform::MacOs);
+        let k = |pid| s.index()[&pid].key;
+        assert_eq!(c.role(k(600)), &Role::Detached { session: k(200) });
+        assert_eq!(c.session(k(602)).map(|x| x.outer), Some(None));
+        assert_eq!(c.session(k(501)).map(|x| x.outer), Some(None));
+        for id in [
+            NodeId::Proc(k(200)),
+            NodeId::Detached(k(200)),
+            NodeId::Proc(k(600)),
+        ] {
+            let pl = plan_kill(&s, &c, &t, &id, KillScope::Tree).unwrap();
+            let got = pids(&pl);
+            assert!(got.contains(&600) && got.contains(&601), "{id:?}");
+            assert!(!got.contains(&602) && !got.contains(&603), "{id:?}");
+            assert!(
+                !pl.warnings.iter().any(|w| matches!(
+                    w,
+                    KillWarning::InterruptsSession { cwd: Some(c), .. } if c == "/Users/u/prj/f"
+                )),
+                "{id:?}"
+            );
+        }
+        // A row that belongs to no session: every session below it stops the walk.
+        let group = t[3].children[0].id.clone();
+        assert!(matches!(group, NodeId::OtherGroup(_)));
+        for id in [group, NodeId::Proc(k(500))] {
+            let pl = plan_kill(&s, &c, &t, &id, KillScope::Tree).unwrap();
+            assert_eq!(pids(&pl), [500], "{id:?}");
+            assert!(pl.warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn under_sudo_other_users_processes_may_be_ended() {
+        let mut v = base();
+        v.push(p(99999, 100, 90, &["cctree"]).root_user());
+        v.push(p(251, 200, 61, &["node", "x"]).root_user());
+        v.push(p(252, 200, 61, &["node", "y"]).other_user());
+        let (mut s, c, t) = setup(v, Platform::MacOs);
+        let key = |s: &Snapshot, pid| s.index()[&pid].key;
+        let plan =
+            |s: &Snapshot, pid, scope| plan_kill(s, &c, &t, &NodeId::Proc(key(s, pid)), scope);
+        s.self_key = key(&s, 99999);
+        // Root: another user's process is fine, a root process still is not.
+        assert_eq!(pids(&plan(&s, 252, KillScope::One).unwrap()), [252]);
+        assert_eq!(
+            plan(&s, 251, KillScope::One),
+            Err(KillRefusal::System { pid: 251 })
+        );
+        assert_eq!(
+            plan(&s, 200, KillScope::Tree),
+            Err(KillRefusal::System { pid: 251 })
+        );
+        // Not root, or not known: refused as before.
+        for me in [
+            key(&s, 230),
+            ProcKey {
+                pid: 4242,
+                start_time: 1,
+            },
+        ] {
+            s.self_key = me;
+            assert_eq!(
+                plan(&s, 252, KillScope::One),
+                Err(KillRefusal::OtherUser { pid: 252 })
+            );
+        }
+    }
+
+    #[test]
+    fn cctree_is_found_where_the_lineage_lost_it() {
+        let refused = |s: &Snapshot, c: &Classification, t: &[Node]| {
+            let k = |pid| s.index()[&pid].key;
+            for (id, scope) in [
+                (NodeId::Proc(k(200)), KillScope::Tree),
+                (NodeId::OtherChildren(k(200)), KillScope::Tree),
+                (NodeId::Proc(k(230)), KillScope::One),
+                (NodeId::Proc(k(200)), KillScope::One),
+            ] {
+                assert_eq!(
+                    plan_kill(s, c, t, &id, scope),
+                    Err(KillRefusal::SelfOrAncestor),
+                    "{id:?} {scope:?}"
+                );
+            }
+        };
+        // cctree's recorded parent 230 looks younger than cctree, so the
+        // lineage drops the link; the recorded ppid still leads to it.
+        let mut v = base();
+        v.push(p(99999, 230, 25, &["cctree"]));
+        let (mut s, c, t) = setup(v, Platform::MacOs);
+        s.self_key = s.index()[&99999].key;
+        assert_eq!(Lineage::build(&s).parent(s.self_key), None);
+        refused(&s, &c, &t);
+        // `self_key` with a start time that does not match: the PID decides.
+        let mut v = base();
+        v.push(p(99999, 230, 90, &["cctree"]));
+        let (mut s, c, t) = setup(v, Platform::MacOs);
+        s.self_key = ProcKey {
+            pid: 99999,
+            start_time: 0,
+        };
+        refused(&s, &c, &t);
     }
 }
