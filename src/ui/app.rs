@@ -159,7 +159,8 @@ fn event_loop(mut term: Term, lang: Lang, color: bool) -> io::Result<()> {
 /// What the ending thread reports.
 enum KillEvent {
     Progress(usize, usize),
-    Done(KillReport),
+    /// The report, and whether the plan was `force_only`.
+    Done(KillReport, bool),
 }
 
 struct App {
@@ -362,7 +363,7 @@ impl App {
                 let _ = tx.send(KillEvent::Progress(done, total));
             };
             let report = execute(&plan, &OsControl, KILL_GRACE, KILL_POLL, &mut progress);
-            let _ = tx.send(KillEvent::Done(report));
+            let _ = tx.send(KillEvent::Done(report, plan.force_only));
         });
     }
 
@@ -380,9 +381,9 @@ impl App {
                     self.st.dialog = Some(Dialog::Killing { done, total });
                     changed = true;
                 }
-                Ok(KillEvent::Done(report)) => {
+                Ok(KillEvent::Done(report, force_only)) => {
                     self.st.dialog = None;
-                    self.say(kill_msg(&report), now);
+                    self.say(kill_msg(&report, force_only), now);
                     let _ = self.to_worker.send(ToWorker::Refresh);
                     return true;
                 }
@@ -411,16 +412,23 @@ fn refusal_msg(r: KillRefusal) -> Msg {
     }
 }
 
-/// The result of a kill: the first failure, or the counts.
-fn kill_msg(r: &KillReport) -> Msg {
+/// The result of a kill: the first failure, or the counts. A `force_only` plan
+/// (Windows) ends every process by force without asking, so none of them "did
+/// not respond": they count as ended normally.
+fn kill_msg(r: &KillReport, force_only: bool) -> Msg {
+    let (graceful, forced) = if force_only {
+        (r.graceful + r.forced, 0)
+    } else {
+        (r.graceful, r.forced)
+    };
     match r.failed.first() {
         Some((pid, e)) => Msg::KillFailed {
             pid: *pid,
             permission: *e == KillError::PermissionDenied,
         },
         None => Msg::KillDone {
-            graceful: r.graceful,
-            forced: r.forced,
+            graceful,
+            forced,
             gone: r.already_gone,
             reused: r.skipped_reused.len(),
             failed: 0,
@@ -498,6 +506,22 @@ mod tests {
             cls,
             config_problems: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_force_only_kill_is_reported_as_ended_normally() {
+        let report = KillReport {
+            forced: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::i18n::msg(Lang::ZhTw, &kill_msg(&report, true)),
+            "已結束 2 個"
+        );
+        assert_eq!(
+            crate::i18n::msg(Lang::ZhTw, &kill_msg(&report, false)),
+            "已結束 2 個（其中 2 個沒回應，已強制結束）"
+        );
     }
 
     #[test]
