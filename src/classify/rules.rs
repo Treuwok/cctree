@@ -27,14 +27,24 @@ pub struct ToolHit {
 ///
 /// - An entry ending in `/` is a directory: any path inside it is excluded.
 /// - Any other entry is a path suffix that must start at a path component, so
-///   `claude.app/contents/macos/claude` does not match `myclaude.app/...`.
+///   `applications/claude.app/contents/macos/claude` does not match
+///   `myapplications/...` or `applications/myclaude.app/...`.
+///
+/// The macOS entries require the app bundle to sit directly in an
+/// `Applications` directory (`/Applications`, `/System/Applications`,
+/// `~/Applications`). Claude Desktop's built-in Claude Code is also a
+/// `claude.app/Contents/MacOS/claude`, but it lives under
+/// `~/Library/Application Support/Claude/claude-code/<version>/` and is a real
+/// session. A bundle outside an `Applications` directory is judged by its name
+/// alone, so `/opt/x/Claude.app/Contents/MacOS/Claude` (`argv[0]` `Claude`) is
+/// detected.
 ///
 /// The Codex CLI that ships inside `ChatGPT.app` lives in a nested
 /// `CodexCLI.app` and runs as `codex`, so none of these entries match it.
 pub const DESKTOP_APP_EXCLUDES: &[&str] = &[
-    "claude.app/contents/macos/claude",
-    "codex.app/contents/macos/codex",
-    "chatgpt.app/contents/macos/chatgpt",
+    "applications/claude.app/contents/macos/claude",
+    "applications/codex.app/contents/macos/codex",
+    "applications/chatgpt.app/contents/macos/chatgpt",
     // Windows install directories: verify with recon.
     "/appdata/local/anthropicclaude/",
     "/appdata/local/programs/claude/",
@@ -351,6 +361,60 @@ mod tests {
             t(&["/Applications/MyClaude.app/Contents/MacOS/Claude"]),
             Some((Tool::ClaudeCode, false))
         );
+    }
+
+    // Claude Desktop keeps its built-in Claude Code under Application Support,
+    // in a lowercase `claude.app` bundle. Those are real sessions.
+    #[test]
+    fn claude_code_inside_claude_desktop_support_dir_is_a_session() {
+        let bundled = "/Users/u/Library/Application Support/Claude/claude-code/2.1.280/claude.app/Contents/MacOS/claude";
+        assert_eq!(t(&[bundled]), Some((Tool::ClaudeCode, false)));
+        let with_exe = p(1, 0, 1, &["claude", "--resume", "x"]).exe(bundled);
+        assert_eq!(
+            detect_tool(&with_exe).map(|h| (h.tool, h.node_wrapper)),
+            Some((Tool::ClaudeCode, false))
+        );
+    }
+
+    // A desktop main is excluded only inside an `Applications` directory.
+    #[test]
+    fn desktop_exclusion_needs_an_applications_directory() {
+        assert_eq!(
+            t(&["/Users/u/Applications/Claude.app/Contents/MacOS/Claude"]),
+            None
+        );
+        assert_eq!(
+            t(&["/System/Applications/Claude.app/Contents/MacOS/Claude"]),
+            None
+        );
+        assert_eq!(t(&["~/Applications/Codex.app/Contents/MacOS/Codex"]), None);
+        // Not under an Applications directory: judged by the name alone, and
+        // `Claude` is `claude`, so it is detected.
+        assert_eq!(
+            t(&["/opt/x/Claude.app/Contents/MacOS/Claude"]),
+            Some((Tool::ClaudeCode, false))
+        );
+        assert_eq!(
+            t(&["/Users/u/Library/Application Support/Claude.app/Contents/MacOS/Claude"]),
+            Some((Tool::ClaudeCode, false))
+        );
+        assert_eq!(
+            t(&["/Users/u/MyApplications/Claude.app/Contents/MacOS/Claude"]),
+            Some((Tool::ClaudeCode, false))
+        );
+    }
+
+    #[test]
+    fn desktop_excludes_are_lowercase_with_forward_slashes() {
+        for entry in DESKTOP_APP_EXCLUDES {
+            assert_eq!(
+                *entry,
+                entry.to_ascii_lowercase(),
+                "{entry} is not lowercase"
+            );
+            assert!(!entry.contains('\\'), "{entry} has a backslash");
+            assert!(!entry.is_empty());
+        }
     }
 
     #[test]
