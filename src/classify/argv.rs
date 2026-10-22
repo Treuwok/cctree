@@ -141,14 +141,23 @@ pub fn config_matches(cfg: &McpServerConfig, argv: &[String]) -> bool {
     })
 }
 
-/// Whether `argv` looks like an MCP server: it was started through a launcher
-/// (see [`normalize_launch`]), or the program or any argument ends in a path
-/// component that contains `mcp` (ignoring case).
+/// Whether `argv` looks like an MCP server. It does if any of these holds:
+/// * it was started through a launcher (see [`normalize_launch`]);
+/// * the program's file name contains `mcp` (`/opt/x/my-mcp`);
+/// * the program is an interpreter (`node`, `nodejs`, `bun`, `deno`, `python`,
+///   `python3`, `python3.12`, ...) and the file name of its script, or the
+///   module after `-m`, contains `mcp` (`node /x/.bin/playwright-mcp`,
+///   `python -m mcp_server_time`).
+///
+/// All comparisons ignore case. Other arguments are never inspected, so
+/// `claude --mcp-config x.json` or `zsh -c "rg mcpServers src/"` do not count,
+/// and neither does any argument that starts with `-` or holds whitespace.
 pub fn looks_like_mcp(argv: &[String]) -> bool {
     let parsed = parse(argv);
     parsed.via_launcher
         || mentions_mcp(&parsed.launch.program)
-        || parsed.launch.args.iter().any(|a| mentions_mcp(a))
+        || interpreter_target(&parsed.launch.program, &parsed.launch.args)
+            .is_some_and(|t| mentions_mcp(t.text()))
 }
 
 /// A name for an MCP server that is not in the user's config: the program of
@@ -156,22 +165,40 @@ pub fn looks_like_mcp(argv: &[String]) -> bool {
 /// component, without an `mcp-server-` / `server-` prefix or a `-mcp-server` /
 /// `-mcp` suffix. If nothing meaningful is left (`@playwright/mcp`), the npm
 /// scope without its `@` is used (`playwright`). Never empty.
+///
+/// Without a launcher, an interpreter (see [`looks_like_mcp`]) is not a name:
+/// the script's file name without extension, or the `-m` module with `_`
+/// written as `-`, takes the program's place (`node /x/.bin/playwright-mcp`
+/// is `playwright`, `python -m mcp_server_time` is `time`). If there is no
+/// script or module, the interpreter's own name remains.
 pub fn mcp_fallback_name(argv: &[String]) -> String {
-    let launch = normalize_launch(argv);
-    let program = strip_version(&launch.program);
-    let (dir, last) = match program.rsplit_once(['/', '\\']) {
-        Some((dir, last)) => (dir, last),
-        None => ("", program),
+    let parsed = parse(argv);
+    let launch = &parsed.launch;
+    let target = if parsed.via_launcher {
+        None
+    } else {
+        interpreter_target(&launch.program, &launch.args)
     };
-    // `image:tag` names the image without its tag.
-    let last = last.split(':').next().unwrap_or(last);
+    let (dir, last): (&str, String) = match target {
+        Some(Target::Script(script)) => ("", script_stem(script).to_string()),
+        Some(Target::Module(module)) => ("", module.replace('_', "-")),
+        None => {
+            let program = strip_version(&launch.program);
+            let (dir, last) = match program.rsplit_once(['/', '\\']) {
+                Some((dir, last)) => (dir, last),
+                None => ("", program),
+            };
+            // `image:tag` names the image without its tag.
+            (dir, last.split(':').next().unwrap_or(last).to_string())
+        }
+    };
     let scope = dir
         .rsplit(['/', '\\'])
         .next()
         .and_then(|d| d.strip_prefix('@'))
         .filter(|s| !s.is_empty());
 
-    let mut name = last;
+    let mut name = last.as_str();
     if let Some(rest) = NAME_PREFIXES.iter().find_map(|p| name.strip_prefix(p)) {
         name = rest;
     }
@@ -372,9 +399,9 @@ fn forward_slashes(path: &str) -> String {
     path.replace('\\', "/")
 }
 
-/// Whether the last path component of `arg` contains `mcp`, ignoring case.
-fn mentions_mcp(arg: &str) -> bool {
-    file_name(arg)
+/// Whether the last path component of `name` contains `mcp`, ignoring case.
+fn mentions_mcp(name: &str) -> bool {
+    file_name(name)
         .as_bytes()
         .windows(3)
         .any(|w| w.eq_ignore_ascii_case(b"mcp"))
@@ -411,14 +438,78 @@ fn script_arg<'a>(runner: &str, args: &'a [String]) -> Option<&'a str> {
     None
 }
 
+/// What an interpreter runs: a script path or a Python module name.
+#[derive(Clone, Copy)]
+enum Target<'a> {
+    Script(&'a str),
+    Module(&'a str),
+}
+
+impl<'a> Target<'a> {
+    fn text(self) -> &'a str {
+        match self {
+            Target::Script(s) | Target::Module(s) => s,
+        }
+    }
+}
+
+/// Whether `program` (a file name without extension) is `python`, `python3`,
+/// `python3.12`, ...
+fn is_python(program: &str) -> bool {
+    program
+        .to_ascii_lowercase()
+        .strip_prefix("python")
+        .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'))
+}
+
+/// The script or `-m` module that the interpreter `program` runs, for `node`,
+/// `nodejs`, `bun`, `deno` and Python. `None` if `program` is none of those,
+/// there is nothing to run (the REPL, `-e code`, `-c code`), or the text holds
+/// whitespace, so it is no file or module name.
+fn interpreter_target<'a>(program: &str, args: &'a [String]) -> Option<Target<'a>> {
+    let target = if is_python(program) {
+        python_target(args)?
+    } else if SCRIPT_RUNNERS
+        .iter()
+        .any(|r| program.eq_ignore_ascii_case(r))
+    {
+        Target::Script(script_arg(program, args)?)
+    } else {
+        return None;
+    };
+    (!target.text().contains(char::is_whitespace)).then_some(target)
+}
+
+/// The module after `-m`, or else the first argument that is not a flag.
+fn python_target(args: &[String]) -> Option<Target<'_>> {
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "-m" => return it.next().map(|m| Target::Module(m)),
+            "-c" => return None,
+            "-W" | "-X" => {
+                it.next();
+            }
+            a if a.starts_with('-') => {}
+            a => return Some(Target::Script(a)),
+        }
+    }
+    None
+}
+
+/// The file name of a script path without its extension.
+fn script_stem(script: &str) -> &str {
+    let file = file_name(script);
+    match file.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem,
+        _ => file,
+    }
+}
+
 /// The name of a script path: its file name without extension, or the name of
 /// its directory for the generic names in [`GENERIC_SCRIPT_NAMES`].
 fn script_name(script: &str) -> &str {
-    let file = file_name(script);
-    let stem = match file.rsplit_once('.') {
-        Some((stem, _)) if !stem.is_empty() => stem,
-        _ => file,
-    };
+    let stem = script_stem(script);
     if GENERIC_SCRIPT_NAMES
         .iter()
         .any(|g| stem.eq_ignore_ascii_case(g))
@@ -756,6 +847,100 @@ mod tests {
             assert!(!looks_like_mcp(&v(no)), "{no}");
         }
         assert!(!looks_like_mcp(&[]));
+    }
+
+    fn words(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn mcp_detection_ignores_argument_values() {
+        for no in [
+            &["zsh", "-c", "rg mcpServers src/"][..],
+            &["claude", "--mcp-config", "x.json"],
+            &["claude", "--strict-mcp-config"],
+            &["/bin/sh", "-c", "~/.claude/hooks/mcp-guard.sh"],
+            &["rg", "mcpServers", "src/"],
+            &["cat", "/x/mcp.json"],
+            // An interpreter's own arguments: flags and strings with spaces.
+            &["node", "--mcp-flag", "/x/server.js"],
+            &["node", "/x/my mcp/server.js"],
+            &["node", "-e", "mcp()"],
+            &["python3", "-c", "import mcp"],
+            &["python3", "/x/server.py", "--mcp"],
+            &["python", "-m", "http.server", "mcp"],
+            &["node"],
+        ] {
+            assert!(!looks_like_mcp(&words(no)), "{no:?}");
+        }
+        for yes in [
+            &["node", "/x/.bin/playwright-mcp"][..],
+            &["python3", "/v/bin/mcp-server-fetch"],
+            &["python", "-m", "mcp_server_time"],
+            &["/opt/x/my-mcp", "--stdio"],
+            &["/usr/bin/python3.12", "-u", "/v/bin/mcp-server-git"],
+            &["C:\\Python\\python.exe", "-m", "mcp_server_time"],
+            &["bun", "run", "/x/mcp-server.ts"],
+            &["node", "--max-old-space-size=64", "/x/MCP.js"],
+            &["npx", "-y", "anything"],
+        ] {
+            assert!(looks_like_mcp(&words(yes)), "{yes:?}");
+        }
+    }
+
+    #[test]
+    fn fallback_name_of_an_interpreted_script() {
+        for (argv, want) in [
+            (&["node", "/x/.bin/playwright-mcp"][..], "playwright"),
+            (&["python3", "/v/bin/mcp-server-fetch"], "fetch"),
+            (&["python", "-m", "mcp_server_time"], "time"),
+            (
+                &["/usr/bin/python3.12", "-u", "/v/bin/mcp-server-git"],
+                "git",
+            ),
+            (&["bun", "run", "/x/dist/context7-mcp.js"], "context7"),
+            (&["node", "--inspect", "/x/server-memory"], "memory"),
+            // Not an interpreter, or no script to name: the program itself.
+            (&["/opt/x/my-mcp", "--stdio"], "my"),
+            (&["node"], "node"),
+            (&["python3", "-c", "import mcp"], "python3"),
+            (&["node", "/x/my mcp/server.js"], "node"),
+            // A launcher still names the package.
+            (&["npx", "-y", "@foo/mcp"], "foo"),
+        ] {
+            assert_eq!(mcp_fallback_name(&words(argv)), want, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn rewritten_title_argv_works_end_to_end() {
+        // What sysinfo reports for `npm exec ...` on macOS, after collection.
+        let raw = words(&[
+            "npm exec chrome-devtools-mcp@latest --browserUrl http://127.0.0.1:9222",
+            "HOME=/Users/u",
+            "LOGNAME=u",
+            "PATH=/usr/bin:/bin",
+        ]);
+        let argv = crate::collect::normalize_argv(raw);
+        let proc_ = p(
+            1,
+            0,
+            1,
+            &argv.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        let c = cfg(
+            "npx",
+            "-y chrome-devtools-mcp@latest --browserUrl http://127.0.0.1:9222",
+        );
+        assert!(config_matches(&c, &proc_.argv));
+        assert!(!config_matches(
+            &cfg("npx", "chrome-devtools-mcp@1.6.0 --autoConnect"),
+            &proc_.argv
+        ));
+        assert!(is_wrapper(&proc_));
+        assert_eq!(display_name(&proc_), "npm");
+        assert_eq!(mcp_fallback_name(&proc_.argv), "chrome-devtools");
+        assert!(looks_like_mcp(&proc_.argv));
     }
 
     #[test]

@@ -66,6 +66,43 @@ fn cpu_percent(prev_ms: u64, now_ms: u64, elapsed: Duration) -> f32 {
     now_ms.saturating_sub(prev_ms) as f32 / wall_ms * 100.0
 }
 
+/// Undoes a rewritten process title.
+///
+/// A Node process that sets `process.title` (`npm exec pkg --flag`) overwrites
+/// its argument area. sysinfo then reports the whole title as `argv[0]`, and the
+/// "arguments" after it are whatever follows in memory: the environment
+/// strings (`HOME=...`, `CLAUDE_CODE_MESSAGING_TOKEN=...`) on macOS, empty
+/// strings on Linux. Keeping those would store environment values that
+/// [`ENV_ALLOWLIST`](crate::model::ENV_ALLOWLIST) was meant to drop (spec 4.3).
+///
+/// If `raw[0]` contains whitespace and every later element is empty or looks
+/// like `NAME=...`, the result is the whitespace-separated words of `raw[0]`.
+/// Anything else is returned unchanged.
+pub fn normalize_argv(raw: Vec<String>) -> Vec<String> {
+    let Some((first, rest)) = raw.split_first() else {
+        return raw;
+    };
+    if !first.contains(|c: char| c.is_ascii_whitespace())
+        || !rest.iter().all(|a| a.is_empty() || is_env_like(a))
+    {
+        return raw;
+    }
+    let words: Vec<String> = first.split_ascii_whitespace().map(str::to_string).collect();
+    if words.is_empty() { raw } else { words }
+}
+
+/// Whether `s` starts with `NAME=`, where `NAME` is `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_env_like(s: &str) -> bool {
+    let Some((name, _)) = s.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Fields read once per process and cached by [`ProcKey`].
 struct StaticInfo {
     name: String,
@@ -172,11 +209,12 @@ impl Collector {
                 StaticInfo {
                     name: p.name().to_string_lossy().into_owned(),
                     exe: p.exe().map(|e| e.to_string_lossy().into_owned()),
-                    argv: p
-                        .cmd()
-                        .iter()
-                        .map(|a| a.to_string_lossy().into_owned())
-                        .collect(),
+                    argv: normalize_argv(
+                        p.cmd()
+                            .iter()
+                            .map(|a| a.to_string_lossy().into_owned())
+                            .collect(),
+                    ),
                     cwd,
                     env,
                     is_own_user: is_own_user(p, own_uid),
@@ -385,6 +423,70 @@ mod tests {
     use super::*;
     use crate::testkit::{p, snap};
     use std::process::{Child, Command, Stdio};
+
+    fn strings(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn normalize_argv_splits_a_rewritten_title_followed_by_environ() {
+        // macOS: the "arguments" after the title are environment strings.
+        let macos = strings(&[
+            "npm exec chrome-devtools-mcp@latest --browserUrl http://127.0.0.1:9222",
+            "HOME=/Users/u",
+            "LOGNAME=u",
+            "PATH=/usr/bin:/bin",
+            "CLAUDE_CODE_MESSAGING_TOKEN=secret",
+            "_=/usr/bin/x",
+            "EMPTY=",
+        ]);
+        assert_eq!(
+            normalize_argv(macos),
+            strings(&[
+                "npm",
+                "exec",
+                "chrome-devtools-mcp@latest",
+                "--browserUrl",
+                "http://127.0.0.1:9222"
+            ])
+        );
+        // Linux: the area after the title is empty strings.
+        assert_eq!(
+            normalize_argv(strings(&["npm exec @playwright/mcp@latest", "", ""])),
+            strings(&["npm", "exec", "@playwright/mcp@latest"])
+        );
+        // A lone argv[0] with whitespace is split too.
+        assert_eq!(normalize_argv(strings(&["a b"])), strings(&["a", "b"]));
+        assert_eq!(normalize_argv(strings(&["a \t b"])), strings(&["a", "b"]));
+    }
+
+    #[test]
+    fn normalize_argv_leaves_real_command_lines_alone() {
+        for argv in [
+            &["node", "/x/a.js", "--flag"][..],
+            // argv[0] has a space, but the next argument is not environment-like.
+            &[
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "--type=renderer",
+            ],
+            // Environment-like arguments, but argv[0] has no whitespace.
+            &["env", "FOO=1", "node"],
+            &["env", "FOO=1"],
+            &["chrome-devtools-mcp", "HOME=/Users/u"],
+            // Not NAME=: leading digit, no name, no `=`.
+            &["a b", "1X=1"],
+            &["a b", "=x"],
+            &["a b", "plain"],
+            &["a b", "-x=1"],
+            &["a b", "HOME=/u", "plain"],
+            &["only-one-word"],
+            &[""],
+            &["   "],
+        ] {
+            assert_eq!(normalize_argv(strings(argv)), strings(argv), "{argv:?}");
+        }
+        assert_eq!(normalize_argv(Vec::new()), Vec::<String>::new());
+    }
 
     /// Kills the child when dropped, so a failing assertion cannot leave a
     /// busy loop running behind the test run.
