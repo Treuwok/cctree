@@ -62,7 +62,7 @@ use crate::classify::{Category, Certainty, Classification, McpPart, Role};
 use crate::model::{Pid, ProcKey, ProcStatus, RawProc, Snapshot, Tool};
 
 /// What a row is. Stable across refreshes, so the cursor can follow a row.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum NodeId {
     Category(Category),
     /// A process row; a session is one too, keyed by its root.

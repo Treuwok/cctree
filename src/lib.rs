@@ -10,3 +10,4 @@ pub mod model;
 #[cfg(test)]
 pub(crate) mod testkit;
 pub mod tree;
+pub mod ui;
