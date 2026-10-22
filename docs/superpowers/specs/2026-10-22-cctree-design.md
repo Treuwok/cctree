@@ -142,7 +142,7 @@ cctree 是一個終端機介面（TUI）工具，像 `top` 一樣持續更新，
   - session cwd 下的 `.mcp.json`
   - 已安裝 plugin 內的 `.mcp.json`
   - 如果有設定 `CLAUDE_CONFIG_DIR`，改從該目錄讀取。
-- Codex：`~/.codex/config.toml` 的 `[mcp_servers.<名稱>]`；如果有設定 `CODEX_HOME`，改從該目錄讀取。
+- Codex：`~/.codex/config.toml` 的 `[mcp_servers.<名稱>]`；如果有設定 `CODEX_HOME`，改從該目錄讀取。另外，snapshot 中各 process 帶的 `CODEX_HOME` 值（例如 plugin 帶起的 Codex 使用暫存的 `codex-home-*`）也要逐一讀取，跟 `CLAUDE_CONFIG_DIR` 的處理方式相同。
 
 比對方式：把設定檔裡的 `command` + `args`，和 process 的 argv 正規化後比對。正規化包括把 `npx -y X` 和 `npm exec X` 視為相同、去掉 `cmd.exe /c` 外殼、忽略路徑差異。例如設定 `npx -y chrome-devtools-mcp@latest --browserUrl …` 對應到 process `npm exec chrome-devtools-mcp@latest --browserUrl …`，節點名稱就是設定檔裡的 `chrome-cdp`。
 
@@ -182,6 +182,8 @@ cctree 是一個終端機介面（TUI）工具，像 `top` 一樣持續更新，
 
 **環境變數讀取規則**：只讀目前使用者的 process，每個 process 只在第一次看到時讀一次；只取出允許清單內的變數名稱，其他變數一律不儲存、不顯示。
 
+「不儲存」也包含記憶體。2026-10-22 實測，MCP 子 process 的環境變數裡就有 `CLAUDE_CODE_MESSAGING_TOKEN` 這類機密。sysinfo 會把讀到的完整環境變數一直留在它的 process 快取裡，所以讀環境變數時要用一個**用完就丟的獨立 sysinfo 實例**：取出允許清單內的變數後立刻釋放，主實例永遠不讀環境變數。
+
 **其他 Node.js**：沒被歸到上面任何一類的 `node`、`npm`、`npx`、`bun`、`deno`，以及 argv 含 `mcp` 的 process，依它最上層的非系統祖先 app 分組，例如「Claude」「Code」「Hermes」。
 
 **殭屍（Z 狀態）**：留在原本所屬的位置，加上「殭屍」標記；畫面最上方顯示殭屍數量。
@@ -210,6 +212,7 @@ cctree 是一個終端機介面（TUI）工具，像 `top` 一樣持續更新，
 - **畫面最上方**顯示系統整體：RAM 已用／總量、swap 已用（Windows 顯示分頁檔／認可）、cctree 自己用了多少。
 - **加總**：分組列與有子孫的 process 列，加總的是主欄位「記憶體」。只要有任何成員讀不到，就在數字前標「約」。共用部分不加總。
 - **下方詳細面板**：選到某個 process 時，顯示上表全部數字，並註明「活動監視器／工作管理員會顯示 X」，方便使用者對照。
+- **白話句要加得起來**：macOS 的 footprint 不完全等於「internal ＋ compressed」。2026-10-22 實測一個 `npm exec`：footprint 63.6 MB，但 internal 0.1 ＋ compressed 56.0，還差 7.5 MB。因此差額大於主數字的 1% 時，要加一項「其他」（系統記帳的其他部分），讓「＝」兩邊永遠相等。Windows、Linux 的對應方式本身就加得起來，不需要這一項。
 
 ### 4.5 CPU
 
@@ -251,8 +254,8 @@ cctree  每 2 秒更新 · RAM 已用 27/36 GB · swap 2.3 GB · cctree 本身 1
 ▶ 其他 Node.js（1）
 ──────────────────────────────────────────────────────────────────
  chrome-live › chrome-devtools-mcp    PID 50094    父 PID 49815
- 記憶體 162 MB ＝ 在 RAM 裡 120 MB ＋ 被擠出 RAM 42 MB（另有 15 MB 與其他程式共用）
- 指令：chrome-devtools-mcp --autoConnect    啟動：今天 11:36（15 分鐘前）
+ 記憶體 162 MB ＝ 在 RAM 裡 112 MB ＋ 被擠出 RAM 42 MB ＋ 其他 8 MB（另有 15 MB 與其他程式共用）
+ 指令：chrome-devtools-mcp --autoConnect    已執行 15 分鐘
 ──────────────────────────────────────────────────────────────────
  ↑↓ 移動  ←→ 收合/展開  x 結束這個  X 結束整棵  m MCP 總覽  空白 暫停  ? 說明  q 離開
 ```
@@ -265,6 +268,8 @@ cctree  每 2 秒更新 · RAM 已用 27/36 GB · swap 2.3 GB · cctree 本身 1
 - **分組列**：四大類、「MCP（n 個）」、各個 MCP、「其他子程序」。分組列沒有自己的 PID，但 MCP 列在 PID 欄顯示 MCP 主程式（server）的 PID，以灰色表示。
 
 **加總方式**（類似 ncdu）：每一列顯示「自己加上底下全部」的總和。有子孫的 process 列展開後，第一個子列是「（本體）」，顯示它自己的數字，所以畫面上的數字永遠加得起來。
+
+**例外：MCP 底下的成員平鋪顯示**。一個 MCP 展開後，成員 process（外殼、server、輔助）依啟動順序排成同一層，每列只顯示自己的數字，輔助 process 前面加 `└`，跟上方 mockup 一樣。這裡不做層層巢狀，也不加「（本體）」列，因為 MCP 那一列本身就是這組的加總。
 
 **預設展開**
 
@@ -333,7 +338,9 @@ cctree  每 2 秒更新 · RAM 已用 27/36 GB · swap 2.3 GB · cctree 本身 1
 - `X` 用在 process 列：結束該 process 和它所有子孫。子孫依目前 snapshot 中經過驗證的 parent 關係判定。
   - 如果是 session 本體，也包含巢狀的子 session，以及「已脫離（仍屬於這個 session）」的 process。已脫離的在確認視窗中另外列一段。
 - `X` 用在分組列：結束組內所有 process 和它們的子孫。
-  - 例外：用在「已失聯」大類時，只結束「確定」的那些。「疑似」的可能是使用者正在用的 app（例如 `ChatGPT Meetings`），必須個別用 `x` 結束。確認視窗要註明「另有 N 個疑似失聯的沒有包含」。
+  - 例外一：用在「Claude Code」「Codex」「其他 Node.js」這三個**大類**本身時一律擋下，訊息列顯示「這一列是整個分類，範圍太大；請到個別 session 或分組上按 X」。
+    - 原因：大類底下是所有 session，或所有和 AI 工具無關的 node process（包括使用者自己在終端機開的 dev server、其他 app 的 node 服務）。一個 `X` 加一個 `Enter` 就全部結束，風險太高。
+  - 例外二：用在「已失聯」大類時，只結束「確定」的那些，這是刻意設計的批次清理。「疑似」的可能是使用者正在用的 app（例如 `ChatGPT Meetings`），必須個別用 `x` 結束。確認視窗要註明「另有 N 個疑似失聯的沒有包含」。
 
 **確認視窗**
 
@@ -363,6 +370,7 @@ cctree  每 2 秒更新 · RAM 已用 27/36 GB · swap 2.3 GB · cctree 本身 1
 2. macOS 與 Linux：從最深的子孫往上，依序送出 `SIGTERM`；最多等 3 秒，期間在訊息列顯示進度；還沒結束的再送 `SIGKILL`。
 3. Windows：從最深的子孫往上，依序用 `TerminateProcess` 直接強制結束。確認視窗要事先寫明「Windows 會直接強制結束」。
 4. 結果用一句話顯示在訊息列，例如「已結束 3 個（其中 1 個沒回應，已強制結束；1 個已經自己結束）」。
+5. 判斷「已經結束」時，殭屍狀態也算已結束。被結束的 process 在 parent 回收之前會短暫變成殭屍，不能因此等滿 3 秒再誤報「沒回應，已強制結束」。送訊號時如果發現 process 已經不在，算進「已經自己結束」，不算失敗。
 
 **會擋下來，並說明原因的情況**
 
@@ -383,7 +391,7 @@ cctree  每 2 秒更新 · RAM 已用 27/36 GB · swap 2.3 GB · cctree 本身 1
 
 | 情況 | 訊息重點 |
 |---|---|
-| 有些 process 讀不到細節 | 顯示數量；Claude／Codex 的統計不受影響；想看全部的話，用 `sudo cctree` 或以系統管理員身分執行 |
+| 有些 process 讀不到細節 | 只計算「名稱看起來是 node／npm／npx／bun／deno／claude／codex，但讀不到命令列」的 process。macOS 上本來就有幾百個系統 process 讀不到，全部算進來的話，這則訊息會永遠掛著，沒有意義。訊息內容：顯示數量；Claude／Codex 的統計不受影響；想看全部的話，用 `sudo cctree` 或以系統管理員身分執行 |
 | Windows 版本太舊，讀不到 Private Working Set | 「在 RAM 裡」欄顯示「—」；請更新 Windows |
 | 結束 process 時權限不足 | 說明原因與替代做法 |
 | 要結束的 process 已經不存在 | 說明它已經自己結束了 |
@@ -406,7 +414,8 @@ cctree  每 2 秒更新 · RAM 已用 27/36 GB · swap 2.3 GB · cctree 本身 1
 - **兩層收集**：
   - 每次更新時，全部 process 只列出 PID、PPID、啟動時間這些便宜的資訊，用來判斷哪些是新出現、哪些已經結束。
   - 新出現的 process 才讀一次 argv、exe、cwd 和環境變數，然後快取起來。
-  - CPU 與平台記憶體 API，只對會顯示在畫面上的 process 讀取，也就是 Claude Code、Codex、已失聯、其他 Node.js 這四類。系統整體數字用全系統的 API 取得。
+  - **CPU 在第一層一起算**，所有 process 都算。原因（2026-10-22 查 sysinfo 原始碼）：sysinfo 在 Linux 上每次 refresh process，不管有沒有要求 CPU，都會呼叫 `set_time` 把「上次的 CPU 時間」換成這次的值。如果第二層才另外讀 CPU，比較的對象是幾毫秒前第一層剛記下的數字，CPU 會永遠接近 0。而且第一層本來就會讀到算 CPU 需要的資料，一起算幾乎不增加成本。
+  - **平台記憶體 API 只對會顯示在畫面上的 process 讀取**，也就是 Claude Code、Codex、已失聯、其他 Node.js 這四類。系統整體數字用全系統的 API 取得。
 - 設定檔只在修改時間改變時重讀；畫面只在資料更新或有輸入時重畫。
 
 ### 4.10 隱私與安全
@@ -433,6 +442,7 @@ cctree  每 2 秒更新 · RAM 已用 27/36 GB · swap 2.3 GB · cctree 本身 1
 
 - **核心邏輯**：辨識、建樹、加總、結束 process 的規劃、遮蔽機密、設定檔比對都是純函式，用 snapshot fixture（JSON）做單元測試。第一份 fixture 來自 §1.1 的實測機器（已遮蔽機密）；Windows 與 Linux 的 fixture 由實機實測補上。
 - **開發者用的匯出指令**：提供一個隱藏參數，例如 `cctree --dump-snapshot <檔案>`，匯出已遮蔽機密的 snapshot，用來製作 fixture，也方便日後的貢獻者回報問題。一般使用者不需要知道這個參數。
+- **fixture 公開前要給作者確認**：遮蔽與匿名化只處理機密與家目錄，專案目錄名稱（可能是客戶或私人專案）仍會留在 cwd 與路徑裡，而 repo 預計公開。所以 commit fixture 前，要把裡面出現的所有路徑列給作者確認；作者指定的名稱改成佔位名稱。
 - **平台記憶體讀取**：在三個平台的 CI runner 上讀取自己這個 process，做合理性檢查，例如 footprint ≥ internal、`VmRSS` ≥ `RssAnon`。
 - **結束 process**：整合測試會實際啟動一棵假的 process 樹，再用 actions 模組結束它；PID 重用的防護另外做單元測試。
 - **介面**：用 ratatui 的 `TestBackend` 做畫面快照測試，涵蓋中文對齊、窄視窗、確認視窗。
