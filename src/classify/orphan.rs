@@ -22,12 +22,25 @@
 //!    (an MCP member or another child, inside an MCP node too; not the root,
 //!    which only inherits its starter's id) names that session, so a resumed
 //!    session that carries two ids is known by both. An id that names a live
-//!    session makes the process detached from it. Any other id names a
-//!    session that has ended: an orphan, only suspected when a live session
-//!    of the same tool works in the project the process was given
-//!    (`CLAUDE_PROJECT_DIR`), confirmed otherwise. A session works in its
+//!    session makes the process detached from it. Any other id makes it an
+//!    orphan: only suspected when a live session of the same tool could own
+//!    it (below), confirmed otherwise. An id that no live member carries does
+//!    not prove its session ended: a session's id changes while it runs
+//!    (`/clear`, `--resume`), its MCP servers keep the old one, and the new
+//!    one is only on children started since, which may all have exited.
+//!
+//!    A live session **could own** the process when it started no later than
+//!    the process and, if the process has a project, works in a directory
+//!    related to it (equal, or one inside the other at a path boundary). The
+//!    project is `CLAUDE_PROJECT_DIR`, else the process's cwd when that is
+//!    below the home directory (`~/` in anonymized snapshots) and not the home
+//!    itself; a desktop app running in `/` has none. A session works in its
 //!    root's cwd and in every project its members were given (a worktree
-//!    session gives them the main checkout).
+//!    session gives them the main checkout); a session with neither known
+//!    could own any process started after it, and so could every session
+//!    when the process's own start time is unknown. Paths compare with `/`
+//!    separators and no trailing one, ignoring ASCII case only when they are
+//!    Windows-style (a `\` or a drive letter).
 //! 2. **Medium**: `--parent-pid=N` or `--parent-pid N`. When no process has
 //!    PID N, or the one that has it started after this process (the PID was
 //!    reused), the recorded owner is gone: a confirmed orphan. A live owner is
@@ -56,8 +69,9 @@
 //! - **Other Node.js group**: [`Lineage::top_app`], or the process's own
 //!   [`app_name`] when there is none.
 //!
-//! Every step is one pass over the processes with hash-map lookups, so the
-//! whole pass is linear in the number of processes.
+//! Every step is one pass over the processes with hash-map lookups (one per
+//! path component for the "could own" check), so the whole pass is linear in
+//! the number of processes.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -67,7 +81,7 @@ use crate::model::{Pid, ProcKey, RawProc, Snapshot, Tool};
 use super::argv::{base_name, looks_like_mcp};
 use super::lineage::{Lineage, app_name, is_shell, is_system_root};
 use super::rules::path_evidence;
-use super::{Certainty, OrphanReason, PROJECT_DIR_ENV, Role, SESSION_ID_ENV, SessionInfo, dir_key};
+use super::{Certainty, OrphanReason, PROJECT_DIR_ENV, Role, SESSION_ID_ENV, SessionInfo};
 
 /// Environment variables through which a tool tells the processes it starts
 /// which session started them.
@@ -183,10 +197,61 @@ pub(crate) fn assign_rest(
 struct Live<'a> {
     /// The live session (root) each session id names, per tool.
     ids: HashMap<(Tool, &'a str), ProcKey>,
-    /// The directories live sessions work in, per tool, as [`dir_key`]s.
-    dirs: HashSet<(Tool, String)>,
-    /// The tools with a live session.
-    tools: HashSet<Tool>,
+    /// When the live sessions started, by where they work.
+    starts: Starts,
+}
+
+/// The earliest start time of the live sessions of a tool, overall and by
+/// the directories they work in (as [`path_key`]s), to answer "could a live
+/// session own this process" (see the module documentation) in a few
+/// lookups per path component.
+#[derive(Default)]
+struct Starts {
+    /// Any live session.
+    any: HashMap<Tool, u64>,
+    /// A live session that works in no known directory.
+    nowhere: HashMap<Tool, u64>,
+    /// A live session that works in exactly this directory.
+    at: HashMap<(Tool, String), u64>,
+    /// A live session that works in this directory or below it.
+    within: HashMap<(Tool, String), u64>,
+}
+
+impl Starts {
+    /// Records a live session of `tool` started at `start` that works in
+    /// `dirs` ([`path_key`]s).
+    fn add(&mut self, tool: Tool, start: u64, dirs: &HashSet<String>) {
+        fn earliest<K: std::hash::Hash + Eq>(map: &mut HashMap<K, u64>, key: K, start: u64) {
+            map.entry(key)
+                .and_modify(|t| *t = (*t).min(start))
+                .or_insert(start);
+        }
+        earliest(&mut self.any, tool, start);
+        if dirs.is_empty() {
+            earliest(&mut self.nowhere, tool, start);
+        }
+        for dir in dirs {
+            earliest(&mut self.at, (tool, dir.clone()), start);
+            earliest(&mut self.within, (tool, dir.clone()), start);
+            for above in parents(dir) {
+                earliest(&mut self.within, (tool, above.to_string()), start);
+            }
+        }
+    }
+
+    /// Whether a live session of `tool` could own a process started at
+    /// `start` (`u64::MAX` when unknown) whose project is `project`.
+    fn could_own(&self, tool: Tool, project: Option<&str>, start: u64) -> bool {
+        let by = |t: Option<&u64>| t.is_some_and(|&t| t <= start);
+        let Some(project) = project else {
+            return by(self.any.get(&tool));
+        };
+        let project = path_key(project);
+        // The session works in the project, below it, or above it.
+        by(self.nowhere.get(&tool))
+            || by(self.within.get(&(tool, project.clone())))
+            || parents(&project).any(|above| by(self.at.get(&(tool, above.to_string()))))
+    }
 }
 
 impl<'a> Live<'a> {
@@ -196,15 +261,17 @@ impl<'a> Live<'a> {
         sessions: &[SessionInfo],
         roles: &HashMap<ProcKey, Role>,
     ) -> Live<'a> {
-        let mut dirs = HashSet::new();
-        let mut tools = HashSet::new();
         let mut index = HashMap::with_capacity(sessions.len());
+        // The directories each session works in.
+        let mut dirs: Vec<HashSet<String>> = Vec::with_capacity(sessions.len());
         for (i, s) in sessions.iter().enumerate() {
             index.insert(s.root, i);
-            tools.insert(s.tool);
-            if let Some(cwd) = non_empty(s.cwd.as_deref()) {
-                dirs.insert((s.tool, dir_key(cwd)));
-            }
+            dirs.push(
+                non_empty(s.cwd.as_deref())
+                    .map(path_key)
+                    .into_iter()
+                    .collect(),
+            );
         }
         // Each id names the index of a session. When several sessions show
         // it, the lowest rank wins: a session of the id's own tool, then the
@@ -230,17 +297,20 @@ impl<'a> Live<'a> {
                         .or_insert(i);
                 }
                 if let Some(dir) = env(p, m.project_dir) {
-                    dirs.insert((m.tool, dir_key(dir)));
+                    dirs[i].insert(path_key(dir));
                 }
             }
+        }
+        let mut starts = Starts::default();
+        for (s, dirs) in sessions.iter().zip(&dirs) {
+            starts.add(s.tool, s.root.start_time, dirs);
         }
         Live {
             ids: ids
                 .into_iter()
                 .map(|(id, i)| (id, sessions[i].root))
                 .collect(),
-            dirs,
-            tools,
+            starts,
         }
     }
 
@@ -257,12 +327,17 @@ impl<'a> Live<'a> {
                 return Some(Verdict::Detached(session));
             }
             let project_dir = env(p, m.project_dir);
-            let certainty =
-                if project_dir.is_some_and(|d| self.dirs.contains(&(m.tool, dir_key(d)))) {
-                    Certainty::Suspected
-                } else {
-                    Certainty::Confirmed
-                };
+            let project = project_dir
+                .or_else(|| non_empty(p.cwd.as_deref()).filter(|cwd| is_below_home(cwd, home)));
+            let start = match p.key.start_time {
+                0 => u64::MAX,
+                start => start,
+            };
+            let certainty = if self.starts.could_own(m.tool, project, start) {
+                Certainty::Suspected
+            } else {
+                Certainty::Confirmed
+            };
             let reason = OrphanReason::SessionEnded {
                 tool: m.tool,
                 project_dir: project_dir.map(str::to_string),
@@ -276,7 +351,8 @@ impl<'a> Live<'a> {
             return Some(Verdict::Orphan(Certainty::Confirmed, reason));
         }
         let tool = path_evidence(p, home)?;
-        (l.is_adopted(p.key) && !self.tools.contains(&tool)).then_some(Verdict::Orphan(
+        let tool_running = self.starts.any.contains_key(&tool);
+        (l.is_adopted(p.key) && !tool_running).then_some(Verdict::Orphan(
             Certainty::Suspected,
             OrphanReason::PathOnly { tool },
         ))
@@ -367,6 +443,41 @@ fn owner_gone(l: &Lineage, p: &RawProc, pid: Pid) -> bool {
         None => true,
         Some(owner) => p.key.start_time != 0 && owner.start_time > p.key.start_time,
     }
+}
+
+/// `path` in the form paths are compared in: `/` separators and no trailing
+/// one. A Windows-style path (one with a `\` or a drive letter) is also ASCII
+/// lowercased; other paths keep their case.
+fn path_key(path: &str) -> String {
+    let windows = path.contains('\\')
+        || matches!(path.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic());
+    let key = path.replace('\\', "/");
+    let key = key.trim_end_matches('/');
+    if windows {
+        key.to_ascii_lowercase()
+    } else {
+        key.to_string()
+    }
+}
+
+/// The directories above the [`path_key`] `key`, each ending at a path
+/// boundary: `/a/b/c` gives the root (an empty key), `/a` and `/a/b`.
+fn parents(key: &str) -> impl Iterator<Item = &str> {
+    key.match_indices('/').map(move |(i, _)| &key[..i])
+}
+
+/// Whether `path` is below the home directory `home` (the home itself is
+/// not), or below `~`, which anonymized snapshots write for it.
+fn is_below_home(path: &str, home: Option<&str>) -> bool {
+    let key = path_key(path);
+    let below = |home: &str| {
+        let home = path_key(home);
+        !home.is_empty()
+            && key
+                .strip_prefix(home.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+    };
+    below("~") || home.is_some_and(below)
 }
 
 /// The value of the environment variable `name` of `p`, unless it is unset or
@@ -559,9 +670,13 @@ mod tests {
         v.push(p(420, 1, 80, &["node", "dev.js"]).env(SID, "S1"));
         v.push(p(421, 420, 81, &["/opt/esbuild", "--service"]));
         v.push(p(422, 421, 82, &["node", "w.js"]).env(SID, "GONE"));
-        // Orphan root, a child with the id of no session, a recorded parent
-        // that is gone.
-        v.push(p(430, 1, 80, &["node", "old.js"]).env(SID, "GONE"));
+        // Orphan root (in a project no live session works in), a child with
+        // the id of no session, a recorded parent that is gone.
+        v.push(
+            p(430, 1, 80, &["node", "old.js"])
+                .env(SID, "GONE")
+                .cwd("/Users/u/prj/old"),
+        );
         v.push(p(431, 430, 81, &["node", "a.js"]).env(SID, "OTHER"));
         v.push(p(432, 431, 82, &["node", "b.js", "--parent-pid=999"]));
         let s = snap(Platform::MacOs, v);
@@ -616,10 +731,13 @@ mod tests {
     fn empty_values_are_no_evidence() {
         let mut v = base();
         v.push(p(445, 1, 80, &["node", "x.js"]).env(SID, ""));
+        // An empty project dir: the cwd is the project, but it is not
+        // reported as the project dir.
         v.push(
             p(446, 1, 80, &["node", "x.js"])
                 .env(SID, "GONE")
-                .env(PROJ, ""),
+                .env(PROJ, "")
+                .cwd("/Users/u/prj/old"),
         );
         let s = snap(Platform::MacOs, v);
         let c = classify(&s, &cfgs());
@@ -649,20 +767,27 @@ mod tests {
             vec![
                 p(1, 0, 1, &["/sbin/launchd"]),
                 p(100, 1, 10, &["/bin/zsh"]),
-                // A worktree session: its members get the main checkout.
-                p(200, 100, 20, &["claude"]).cwd("/Users/u/prj/main/.claude/worktrees/w"),
+                // A session in a sibling worktree: its members get the main
+                // checkout, which is not below its cwd.
+                p(200, 100, 20, &["claude"]).cwd("/Users/u/prj/main-wt"),
                 p(230, 200, 30, &["node", "x.js"]).env(PROJ, "/Users/u/prj/main"),
                 // A live Codex session in another project.
                 p(600, 1, 9, &["codex"]).cwd("/Users/u/prj/other"),
                 p(450, 1, 80, &["node", "a.js"])
                     .env(SID, "GONE")
-                    .env(PROJ, "/Users/U/prj/main/"),
+                    .env(PROJ, "/Users/u/prj/main/"),
                 p(451, 1, 80, &["node", "b.js"])
                     .env(SID, "GONE")
-                    .env(PROJ, "/Users/u/prj/main/.claude/worktrees/w"),
+                    .env(PROJ, "/Users/u/prj/main-wt"),
                 p(452, 1, 80, &["node", "c.js"])
                     .env(SID, "GONE")
                     .env(PROJ, "/Users/u/prj/other"),
+                p(453, 1, 80, &["node", "d.js"])
+                    .env(SID, "GONE")
+                    .env(PROJ, "/Users/u/prj/mai"),
+                p(454, 1, 80, &["node", "e.js"])
+                    .env(SID, "GONE")
+                    .env(PROJ, "/Users/U/prj/main"),
             ],
         );
         let c = classify(&s, &McpConfigs::default());
@@ -674,15 +799,189 @@ mod tests {
             } => Some(*certainty),
             _ => None,
         };
+        // The members' project (trailing separator ignored), the root's cwd.
         assert_eq!(certainty(450), Some(Certainty::Suspected));
         assert_eq!(certainty(451), Some(Certainty::Suspected));
-        // Only a session of the same tool counts.
-        assert_eq!(certainty(452), Some(Certainty::Confirmed));
+        // Only a session of the same tool counts; a prefix must end at a
+        // path boundary; Unix paths keep their case.
+        for pid in [452, 453, 454] {
+            assert_eq!(certainty(pid), Some(Certainty::Confirmed), "{pid}");
+        }
         assert!(matches!(
             c.role(k(450)),
             Role::Orphan { reason: OrphanReason::SessionEnded { project_dir: Some(d), .. }, .. }
-                if d == "/Users/U/prj/main/"
+                if d == "/Users/u/prj/main/"
         ));
+    }
+
+    // ---- Controller ruling 2: who could own an unmapped id ----
+
+    /// The certainty of the orphan `orphan` (pid 700, with a child 701) in a
+    /// macOS snapshot with home `home` and the given live session roots
+    /// (children of a login shell started at 10).
+    fn certainty_of(home: &str, sessions: &[RawProc], orphan: RawProc) -> Option<Certainty> {
+        let mut v = vec![p(1, 0, 1, &["/sbin/launchd"]), p(100, 1, 10, &["/bin/zsh"])];
+        v.extend(sessions.iter().cloned());
+        v.push(orphan);
+        v.push(p(701, 700, 81, &["node", "child.js"]));
+        let mut s = snap(Platform::MacOs, v);
+        s.home = Some(home.into());
+        let c = classify(&s, &McpConfigs::default());
+        let k = |pid| s.index()[&pid].key;
+        assert_eq!(c.role(k(701)), &Role::OrphanMember { root: k(700) });
+        match c.role(k(700)) {
+            Role::Orphan {
+                certainty,
+                reason: OrphanReason::SessionEnded { .. },
+            } => Some(*certainty),
+            _ => None,
+        }
+    }
+
+    /// A live Claude Code session root in `cwd`, started at `start`.
+    fn claude_at(cwd: &str, start: u64) -> RawProc {
+        p(200, 100, start, &["claude"]).cwd(cwd)
+    }
+
+    /// An orphan tree root with an id no live session carries, in `cwd`,
+    /// started at 80, without `CLAUDE_PROJECT_DIR`.
+    fn gone_in(cwd: &str) -> RawProc {
+        p(700, 1, 80, &["node", "dev.js"]).env(SID, "GONE").cwd(cwd)
+    }
+
+    const HOME: &str = "/Users/u";
+    const SUSPECTED: Option<Certainty> = Some(Certainty::Suspected);
+    const CONFIRMED: Option<Certainty> = Some(Certainty::Confirmed);
+
+    #[test]
+    fn unmapped_id_below_an_earlier_sessions_cwd_is_suspected() {
+        let earlier = [claude_at("/Users/u/prj/a", 20)];
+        assert_eq!(
+            certainty_of(HOME, &earlier, gone_in("/Users/u/prj/a/sub")),
+            SUSPECTED
+        );
+    }
+
+    #[test]
+    fn unmapped_id_in_another_project_is_confirmed() {
+        let other = [claude_at("/Users/u/prj/other", 20)];
+        assert_eq!(
+            certainty_of(HOME, &other, gone_in("/Users/u/prj/a/sub")),
+            CONFIRMED
+        );
+    }
+
+    #[test]
+    fn a_session_started_after_the_orphan_cannot_own_it() {
+        let later_other = [claude_at("/Users/u/prj/other", 90)];
+        assert_eq!(
+            certainty_of(HOME, &later_other, gone_in("/Users/u/prj/a/sub")),
+            CONFIRMED
+        );
+        let later_same = [claude_at("/Users/u/prj/a", 90)];
+        assert_eq!(
+            certainty_of(HOME, &later_same, gone_in("/Users/u/prj/a/sub")),
+            CONFIRMED
+        );
+        // Started in the same second: it could.
+        let same_second = [claude_at("/Users/u/prj/a", 80)];
+        assert_eq!(
+            certainty_of(HOME, &same_second, gone_in("/Users/u/prj/a/sub")),
+            SUSPECTED
+        );
+    }
+
+    #[test]
+    fn without_a_project_any_earlier_session_could_own_it() {
+        // A desktop app (OrbStack) runs in `/`.
+        let app = || gone_in("/");
+        assert_eq!(
+            certainty_of(HOME, &[claude_at("/Users/u/prj/other", 20)], app()),
+            SUSPECTED
+        );
+        assert_eq!(certainty_of(HOME, &[], app()), CONFIRMED);
+        assert_eq!(
+            certainty_of(HOME, &[claude_at("/Users/u/prj/other", 90)], app()),
+            CONFIRMED
+        );
+        // Only a session of the same tool counts.
+        let codex = [p(200, 100, 20, &["codex"]).cwd("/Users/u/prj/other")];
+        assert_eq!(certainty_of(HOME, &codex, app()), CONFIRMED);
+    }
+
+    #[test]
+    fn the_project_dir_wins_over_the_cwd() {
+        let earlier = [claude_at("/Users/u/prj/a", 20)];
+        let in_tmp = gone_in("/tmp").env(PROJ, "/Users/u/prj/a");
+        assert_eq!(certainty_of(HOME, &earlier, in_tmp), SUSPECTED);
+        let elsewhere = gone_in("/Users/u/prj/a/sub").env(PROJ, "/Users/u/prj/old");
+        assert_eq!(certainty_of(HOME, &earlier, elsewhere), CONFIRMED);
+    }
+
+    #[test]
+    fn which_cwd_counts_as_a_project() {
+        let other = [claude_at("/Users/u/prj/other", 20)];
+        // The home itself, or a cwd outside home, is no project.
+        for cwd in ["/Users/u", "/Users/u/", "/Users/uu/prj/a", "/tmp/x"] {
+            assert_eq!(certainty_of(HOME, &other, gone_in(cwd)), SUSPECTED, "{cwd}");
+        }
+        // A session below the orphan's project is related, too.
+        let worktree = [claude_at("/Users/u/prj/a/.claude/worktrees/wt", 20)];
+        assert_eq!(
+            certainty_of(HOME, &worktree, gone_in("/Users/u/prj/a")),
+            SUSPECTED
+        );
+        // Not at a path boundary, or another case on a Unix path.
+        for session in ["/Users/u/prj/ab", "/Users/u/prj/A"] {
+            assert_eq!(
+                certainty_of(HOME, &[claude_at(session, 20)], gone_in("/Users/u/prj/a/x")),
+                CONFIRMED,
+                "{session}"
+            );
+        }
+        // Anonymized snapshots: `~/` is below home whatever home says.
+        assert_eq!(
+            certainty_of("~", &[claude_at("~/prj/a", 20)], gone_in("~/prj/a/x")),
+            SUSPECTED
+        );
+        assert_eq!(
+            certainty_of("~", &[claude_at("~/prj/a", 20)], gone_in("~/prj/b")),
+            CONFIRMED
+        );
+        assert_eq!(
+            certainty_of(HOME, &[claude_at("~/prj/a", 20)], gone_in("~/prj/b")),
+            CONFIRMED
+        );
+        // Windows paths ignore case and separator style.
+        let win_home = r"C:\Users\u";
+        let win = [claude_at(r"C:\Users\u\prj\a", 20)];
+        assert_eq!(
+            certainty_of(win_home, &win, gone_in(r"c:\users\U\PRJ\A\sub\")),
+            SUSPECTED
+        );
+        assert_eq!(
+            certainty_of(win_home, &win, gone_in("C:/Users/u/prj/b")),
+            CONFIRMED
+        );
+    }
+
+    #[test]
+    fn unknown_start_times_could_own_or_be_owned() {
+        let earlier = [claude_at("/Users/u/prj/a", 20)];
+        // The orphan's own start time is unknown: a later session may have
+        // started it.
+        let unknown = p(700, 1, 0, &["node", "dev.js"])
+            .env(SID, "GONE")
+            .cwd("/Users/u/prj/a/sub");
+        let later = [claude_at("/Users/u/prj/a", 90)];
+        assert_eq!(certainty_of(HOME, &later, unknown), SUSPECTED);
+        // A session whose cwd is unknown could own any later process.
+        let mut nowhere = earlier[0].clone();
+        nowhere.cwd = None;
+        assert_eq!(
+            certainty_of(HOME, &[nowhere], gone_in("/Users/u/prj/b")),
+            SUSPECTED
+        );
     }
 
     #[test]
@@ -835,13 +1134,7 @@ mod tests {
         assert_eq!(c.role(k(450)), &Role::Unrelated);
         assert_eq!(c.role(k(451)), &Role::Unrelated);
         assert_eq!(c.role(k(452)), &Role::SessionRoot);
-        assert!(matches!(
-            c.role(k(453)),
-            Role::Orphan {
-                certainty: Certainty::Confirmed,
-                ..
-            }
-        ));
+        assert!(matches!(c.role(k(453)), Role::Orphan { .. }));
         assert_eq!(c.role(k(454)), &Role::OrphanMember { root: k(453) });
     }
 

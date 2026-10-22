@@ -478,15 +478,12 @@ fn scope_rank(scope: &McpScope, own_dirs: [Option<&str>; 2]) -> u8 {
 /// Whether two directory paths name the same directory, ignoring the
 /// separator style, a trailing separator and ASCII case.
 fn same_dir(a: &str, b: &str) -> bool {
-    !a.is_empty() && dir_key(a) == dir_key(b)
-}
-
-/// `d` in the form [`same_dir`] compares: `/` separators, no trailing one,
-/// ASCII lowercase.
-fn dir_key(d: &str) -> String {
-    d.replace('\\', "/")
-        .trim_end_matches('/')
-        .to_ascii_lowercase()
+    let norm = |d: &str| {
+        d.replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+    };
+    !a.is_empty() && norm(a) == norm(b)
 }
 
 #[cfg(test)]
