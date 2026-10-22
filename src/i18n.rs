@@ -214,6 +214,9 @@ catalog! {
         "Unofficial tool; not affiliated with Anthropic or OpenAI.",
     ),
     HelpClose => ("按任意鍵關閉說明", "Press any key to close this help"),
+    /// At the foot of the help page while there is more below; the arrow
+    /// keys scroll it.
+    HelpMore => ("↓ 還有更多（↑↓ 捲動）", "↓ more (↑↓ scroll)"),
 
     // ---- Key bar (spec 4.6 mockup; the order there is the order to use) ----
     KeyMove => ("↑↓ 移動", "↑↓ move"),

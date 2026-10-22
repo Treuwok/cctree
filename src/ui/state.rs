@@ -68,6 +68,10 @@ pub struct UiState {
     pub dialog: Option<Dialog>,
     pub message: Option<Msg>,
     pub help_open: bool,
+    /// How many lines the help page is scrolled. It may run past the end:
+    /// the renderer clamps it, and hands the clamped value back in
+    /// [`Layout::help_scroll`](super::Layout::help_scroll) to be stored here.
+    pub help_scroll: u16,
     /// For the renderer to keep the cursor in view; nothing here moves it.
     pub scroll: usize,
     /// When each process was first noticed; `None` is "there when cctree
@@ -97,6 +101,7 @@ impl UiState {
             dialog: None,
             message: None,
             help_open: false,
+            help_scroll: 0,
             scroll: 0,
             first_seen: HashMap::new(),
             seeded: false,
@@ -158,6 +163,9 @@ pub enum Action {
 ///   open, so closing one changes nothing you can see.
 /// - `ToggleView` drops the cursor (its row is not in the other view); the
 ///   next [`reselect`](super::reselect) puts it on the first row.
+/// - While the help is open, `Up`, `Down`, `PageUp`, `PageDown`, `Home` and
+///   `End` scroll it ([`UiState::help_scroll`]) and the cursor stays; opening
+///   or closing it puts it back at the top.
 /// - `Cancel` closes the help, or else clears the search. A dialog's `Cancel`
 ///   is the app's.
 /// - `KillOne`, `KillTree`, `Quit`, `Confirm` and `None` do nothing here.
@@ -177,7 +185,14 @@ pub fn apply(st: &mut UiState, a: &Action, rows: &[Row], page: usize) {
             st.expanded.insert(r.id.clone());
         }
     };
+    let by = u16::try_from(page).unwrap_or(u16::MAX);
     match a {
+        Action::Up if st.help_open => st.help_scroll = st.help_scroll.saturating_sub(1),
+        Action::Down if st.help_open => st.help_scroll = st.help_scroll.saturating_add(1),
+        Action::PageUp if st.help_open => st.help_scroll = st.help_scroll.saturating_sub(by),
+        Action::PageDown if st.help_open => st.help_scroll = st.help_scroll.saturating_add(by),
+        Action::Home if st.help_open => st.help_scroll = 0,
+        Action::End if st.help_open => st.help_scroll = u16::MAX,
         Action::Up => go(st, cur.map_or(0, |i| i.saturating_sub(1))),
         Action::Down => go(st, cur.map_or(0, |i| i + 1)),
         Action::PageUp => go(st, cur.unwrap_or(0).saturating_sub(page)),
@@ -242,6 +257,7 @@ pub fn apply(st: &mut UiState, a: &Action, rows: &[Row], page: usize) {
         Action::Cancel => {
             if st.help_open {
                 st.help_open = false;
+                st.help_scroll = 0;
             } else {
                 st.search = None;
                 st.search_editing = false;
@@ -250,7 +266,10 @@ pub fn apply(st: &mut UiState, a: &Action, rows: &[Row], page: usize) {
         Action::TogglePause => st.paused = !st.paused,
         Action::Faster => st.interval_secs = st.interval_secs.saturating_sub(1).max(MIN_INTERVAL),
         Action::Slower => st.interval_secs = (st.interval_secs + 1).min(MAX_INTERVAL),
-        Action::Help => st.help_open = !st.help_open,
+        Action::Help => {
+            st.help_open = !st.help_open;
+            st.help_scroll = 0;
+        }
         _ => {}
     }
     refresh_path(st, rows);

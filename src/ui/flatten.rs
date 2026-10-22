@@ -9,7 +9,9 @@
 //!   largest first, PID and name smallest first; a row without the value goes
 //!   last). The categories keep their order, a `SelfRow` is always first and a
 //!   `NestedNote` always last. Ties go by PID, then by id, so a refresh never
-//!   shuffles equal rows.
+//!   shuffles equal rows. The members of an MCP row (and of an instance in
+//!   the overview) are not sorted: they stay in the tree's order, the start
+//!   order (wrapper, server, helpers).
 //! - **Search**: a row matches when its name or PID contains the text, ignoring
 //!   case. Only matches and their ancestors are listed, and those ancestors are
 //!   open whatever `expanded` says. The name is the row's label text: the name
@@ -80,7 +82,7 @@ fn visit(n: &Node, depth: usize, cx: &Cx, out: &mut Vec<Row>) {
     // Under a search every row is visited: a match may be anywhere below.
     let open = cx.query.is_some() || cx.st.expanded.contains(&n.id);
     if open {
-        for c in sorted(&n.children, cx.st.sort) {
+        for c in ordered(n, cx.st.sort) {
             visit(c, depth + 1, cx, out);
         }
     }
@@ -147,6 +149,16 @@ fn matches(n: &Node, query: &str) -> bool {
             .into_iter()
             .flatten()
             .any(|t| t.to_lowercase().contains(query))
+}
+
+/// The children of `n` in the order they are drawn: the members of an MCP
+/// keep the tree's order (start order), any other siblings are sorted.
+fn ordered(n: &Node, key: SortKey) -> Vec<&Node> {
+    if matches!(n.id, NodeId::Mcp(_) | NodeId::OverviewInstance(..)) {
+        n.children.iter().collect()
+    } else {
+        sorted(&n.children, key)
+    }
 }
 
 /// The siblings in the order they are drawn.

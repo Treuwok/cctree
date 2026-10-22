@@ -186,6 +186,67 @@ mod tests {
     }
 
     #[test]
+    fn mcp_members_stay_in_start_order_whatever_the_sort() {
+        // The watchdog (212) is the biggest, yet it stays last: wrapper,
+        // server, helper.
+        let mut v = base();
+        v.iter_mut()
+            .find(|p| p.key.pid == 212)
+            .unwrap()
+            .mem
+            .as_mut()
+            .unwrap()
+            .private = Some(500 << 20);
+        for view in [ViewMode::BySession, ViewMode::McpOverview] {
+            let t = tree(v.clone(), view);
+            let mut s = st();
+            all_ids(&t, &mut s.expanded);
+            let r = flatten(&t, &s, Instant::now());
+            let head = r
+                .iter()
+                .position(|x| matches!(&x.node.label, Label::Mcp { name, .. } | Label::OverviewMcp { name, .. } if name == "chrome-cdp"))
+                .unwrap();
+            // Everything below the MCP row is its members (in the overview, an
+            // instance of the session first).
+            let members: Vec<_> = r[head + 1..]
+                .iter()
+                .take_while(|x| x.depth > r[head].depth)
+                .filter(|x| matches!(x.id, NodeId::Proc(_)))
+                .map(|x| x.node.pid)
+                .collect();
+            assert_eq!(members, [Some(210), Some(211), Some(212)], "{view:?}");
+        }
+    }
+
+    #[test]
+    fn arrow_keys_scroll_the_help_not_the_cursor() {
+        let t = tree(base(), ViewMode::BySession);
+        let mut s = st();
+        let r = flatten(&t, &s, Instant::now());
+        apply(&mut s, &Action::Down, &r, 10);
+        let cursor = s.selected.clone();
+        assert!(cursor.is_some());
+        apply(&mut s, &Action::Help, &r, 10);
+        for (a, want) in [
+            (Action::Down, 1),
+            (Action::PageDown, 11),
+            (Action::Up, 10),
+            (Action::PageUp, 0),
+            (Action::End, u16::MAX),
+            (Action::Home, 0),
+        ] {
+            apply(&mut s, &a, &r, 10);
+            assert_eq!((s.help_scroll, &s.selected), (want, &cursor), "{a:?}");
+        }
+        apply(&mut s, &Action::Down, &r, 10);
+        apply(&mut s, &Action::Cancel, &r, 10);
+        assert_eq!((s.help_open, s.help_scroll), (false, 0));
+        // Closed again, the arrow keys move the cursor.
+        apply(&mut s, &Action::Down, &r, 10);
+        assert_ne!(s.selected, cursor);
+    }
+
+    #[test]
     fn keys_drive_search_sort_view_pause_and_interval() {
         let mut s = st();
         let press = |s: &mut UiState, a: Action| apply(s, &a, &[], 10);

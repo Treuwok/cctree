@@ -13,7 +13,9 @@
 //!
 //! The terminal must be at least 80×24 ([`MIN_WIDTH`], [`MIN_HEIGHT`]); below
 //! that only [`Msg::TooSmall`] is drawn. The help page and the kill dialog
-//! are drawn over the main screen.
+//! are drawn over the main screen. The help page is longer than 24 lines, so
+//! it scrolls ([`UiState::help_scroll`]); a hint at its foot says when there
+//! is more below.
 //!
 //! # Choices the spec leaves open
 //!
@@ -29,9 +31,9 @@
 //!   part is the end of a message and must not be lost), instead of the
 //!   selected row.
 //! - **Too wide for 80 columns**: the header and the key bar drop their items
-//!   by priority until they fit (the sort and the view in the header, then
-//!   `? help`; in the key bar the fold hint, `s`, `m`, ...), so `?` and `q`
-//!   stay as long as possible. Neither wraps.
+//!   by priority until they fit, and neither wraps. The header drops the sort,
+//!   the view, `? help`, ...; the key bar drops `/`, `s`, `m`, pause, `?`, in
+//!   that order, so the moving, folding and ending keys and `q` stay.
 //! - **Scrolling**: [`UiState::scroll`] is read, not written, because the view
 //!   is immutable; [`Layout::first_row`] is where the table starts after
 //!   keeping the cursor in view, and the app stores it back.
@@ -111,6 +113,10 @@ pub struct Layout {
     pub table: Rect,
     /// The index of the first row drawn; store it in [`UiState::scroll`].
     pub first_row: usize,
+    /// How far the help page is scrolled once clamped to its length; store it
+    /// in [`UiState::help_scroll`]. Without it, `End` followed by `Up` would
+    /// start from a number far past the last line.
+    pub help_scroll: usize,
 }
 
 /// Draws `v` on `f`.
@@ -127,11 +133,12 @@ pub fn draw(f: &mut Frame, v: &View) -> Layout {
         return Layout {
             table: Rect::default(),
             first_row: 0,
+            help_scroll: v.st.help_scroll.into(),
         };
     }
-    let layout = ui.main(f, area);
+    let mut layout = ui.main(f, area);
     if v.st.help_open {
-        ui.help(f, area);
+        layout.help_scroll = ui.help(f, area);
     } else if let Some(Dialog::ConfirmKill(plan)) = &v.st.dialog {
         ui.kill_dialog(f, area, plan);
     }
@@ -245,7 +252,11 @@ impl Ui<'_> {
         let msg_y = rule_y + 1 + DETAIL_H as u16;
         self.message_line(f, Rect::new(x, msg_y, w, 1));
         self.key_bar(f, Rect::new(x, msg_y + 1, w, 1));
-        Layout { table, first_row }
+        Layout {
+            table,
+            first_row,
+            help_scroll: self.v.st.help_scroll.into(),
+        }
     }
 
     // ---- Header and key bar -------------------------------------------------
@@ -840,7 +851,8 @@ impl Ui<'_> {
         );
     }
 
-    fn help(&self, f: &mut Frame, area: Rect) {
+    /// Draws the help page over `area`; returns the scroll it used.
+    fn help(&self, f: &mut Frame, area: Rect) -> usize {
         let (lang, look) = (self.lang, self.look);
         let text_w = (area.width as usize).saturating_sub(4);
         let mut lines: Vec<Styled> = Vec::new();
@@ -857,8 +869,8 @@ impl Ui<'_> {
         lines.push((tr(lang, Text::HelpTitle).to_string(), look.bold()));
         para(&mut lines, tr(lang, Text::HelpIntro), plain);
 
-        // The memory words first: they are what the page is for, and the
-        // page does not scroll.
+        // The memory words first: they are what the page is for, so the first
+        // screen already has them.
         heading(&mut lines, tr(lang, Text::HelpMemoryTitle));
         for (name, what) in help_memory_terms(lang) {
             para(&mut lines, &format!("{name}{colon}{what}"), plain);
@@ -893,18 +905,28 @@ impl Ui<'_> {
         para(&mut lines, tr(lang, Text::HelpFooter), look.dim());
 
         f.render_widget(Clear, area);
+        // The last line is the hint; the page scrolls above it.
         let room = (area.height as usize).saturating_sub(1);
-        lines.truncate(room);
+        let scroll = (self.v.st.help_scroll as usize).min(lines.len().saturating_sub(room));
+        let more = scroll + room < lines.len();
         let body: Vec<Line> = lines
             .into_iter()
+            .skip(scroll)
+            .take(room)
             .map(|(t, s)| Line::styled(format!(" {t}"), s))
             .collect();
         f.render_widget(Paragraph::new(body), area);
-        let close = format!(" {}", tr(lang, Text::HelpClose));
+        let close = tr(lang, Text::HelpClose);
+        let hint = if more {
+            format!(" {}    {close}", tr(lang, Text::HelpMore))
+        } else {
+            format!(" {close}")
+        };
         f.render_widget(
-            Paragraph::new(Line::styled(close, look.dim())),
+            Paragraph::new(Line::styled(hint, look.dim())),
             Rect::new(area.x, area.bottom() - 1, area.width, 1),
         );
+        scroll
     }
 }
 
@@ -949,18 +971,19 @@ fn keep_fitting(mut items: Vec<Item>, sep: usize, width: usize) -> Vec<Item> {
 }
 
 /// How soon a key-bar entry goes when the bar is too narrow (the bigger, the
-/// sooner). `?` and `q` stay longest.
+/// sooner): `/`, `s`, `m`, pause, then `?`. The moving, folding and ending
+/// keys and `q` stay.
 fn key_priority(k: Text) -> u8 {
     match k {
-        Text::KeyFold => 9,
+        Text::KeySearch => 9,
         Text::KeySort => 8,
         Text::KeyMcp => 7,
         Text::KeyPause | Text::KeyResume => 6,
-        Text::KeySearch => 5,
+        Text::KeyHelp => 5,
         Text::KeyKillTree => 4,
         Text::KeyKillOne => 3,
-        Text::KeyMove => 2,
-        Text::KeyHelp => 1,
+        Text::KeyFold => 2,
+        Text::KeyMove => 1,
         _ => 0,
     }
 }
@@ -1208,11 +1231,29 @@ mod tests {
     }
 
     #[test]
+    fn render_key_bar_at_80_keeps_navigation_and_quit() {
+        let out = render(80, 24, false, |_| {});
+        assert!(out.contains("↑↓ 移動  ←→ 收合/展開  x 結束這個  X 結束整棵"));
+        assert!(out.contains("q 離開"));
+    }
+
+    #[test]
     fn render_help_zh_has_memory_glossary() {
         let out = render(100, 40, false, |s| s.help_open = true);
         for k in ["記憶體", "在 RAM 裡", "被擠出 RAM", "共用部分"] {
             assert!(out.contains(k), "{k}");
         }
+    }
+
+    #[test]
+    fn render_help_at_80x24_scrolls_to_the_footer() {
+        let top = render(80, 24, false, |s| s.help_open = true);
+        assert!(top.contains("↓ 還有更多") && !top.contains("非官方工具"));
+        let end = render(80, 24, false, |s| {
+            s.help_open = true;
+            s.help_scroll = u16::MAX;
+        });
+        assert!(end.contains("非官方工具") && !end.contains("↓ 還有更多"));
     }
 
     #[test]
