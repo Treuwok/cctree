@@ -50,6 +50,7 @@ fn mask_arg(arg: &str) -> String {
     let s = mask_bearer(&s);
     let s = mask_named_assignment(&s);
     let s = mask_embedded_assignments(&s);
+    let s = mask_header_values(&s);
     mask_known_prefixes(&s)
 }
 
@@ -220,6 +221,66 @@ fn mask_embedded_assignments(s: &str) -> String {
         resume = content_start + value_len;
         if value_len > 0 {
             out.push_str(&s[copied..content_start]);
+            out.push_str(MASK);
+            copied = resume;
+        }
+    }
+    out.push_str(&s[copied..]);
+    out
+}
+
+/// Authorization schemes kept in front of a masked header value.
+const AUTH_SCHEMES: &[&str] = &["basic", "bearer", "digest", "token"];
+
+/// If `s` starts with `NAME:` where `NAME` is `[A-Za-z][A-Za-z0-9_-]*` and says
+/// it carries a secret, returns the byte length of that head (through `:`).
+/// `NAME://` is a URL, not a header.
+fn secret_header_head(s: &str) -> Option<usize> {
+    if !s.chars().next()?.is_ascii_alphabetic() {
+        return None;
+    }
+    let name_len = s
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .unwrap_or(s.len());
+    let rest = &s[name_len..];
+    if !rest.starts_with(':') || rest.starts_with("://") || !has_secret_name(&s[..name_len]) {
+        return None;
+    }
+    Some(name_len + 1)
+}
+
+/// Masks the value of an HTTP header whose name contains key/token/secret/
+/// password/auth: `X-Api-Key: abc` becomes `X-Api-Key: ***`, also without the
+/// space (`mcp-remote --header X-Api-Key:abc`), after `--header=`, or inside a
+/// `sh -c` string. An authorization scheme is kept, so `Authorization: Basic
+/// abc` becomes `Authorization: Basic ***`.
+fn mask_header_values(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut copied = 0;
+    let mut resume = 0;
+    for (i, _) in s.char_indices() {
+        let before = s[..i].chars().next_back();
+        if i < resume || !(is_assignment_boundary(before) || before == Some('=')) {
+            continue;
+        }
+        let Some(head) = secret_header_head(&s[i..]) else {
+            continue;
+        };
+        let after_colon = i + head;
+        let mut value_start =
+            after_colon + (s[after_colon..].len() - s[after_colon..].trim_start().len());
+        let word_len = s[value_start..]
+            .find(char::is_whitespace)
+            .unwrap_or(s.len() - value_start);
+        let word = &s[value_start..value_start + word_len];
+        if AUTH_SCHEMES.iter().any(|a| word.eq_ignore_ascii_case(a)) {
+            let rest = &s[value_start + word_len..];
+            value_start += word_len + (rest.len() - rest.trim_start().len());
+        }
+        let value_len = secret_len(&s[value_start..]);
+        resume = value_start + value_len;
+        if value_len > 0 {
+            out.push_str(&s[copied..value_start]);
             out.push_str(MASK);
             copied = resume;
         }
@@ -408,9 +469,42 @@ mod tests {
             "-c",
             "curl --token sk-abc",
             "{\"api_key\":\"sk-1\"}",
+            "X-Api-Key: k1",
+            "Authorization: Basic b64",
         ];
         let once = m(&all);
         assert_eq!(mask_argv(&once), once);
+    }
+
+    // PR review: credentials passed as HTTP headers (`--header`, `-H`, `sh -c "curl -H ..."`).
+    #[test]
+    fn masks_secret_header_values() {
+        assert_eq!(
+            m(&[
+                "mcp-remote",
+                "https://x/mcp",
+                "--header",
+                "X-Api-Key: customer-secret"
+            ]),
+            ["mcp-remote", "https://x/mcp", "--header", "X-Api-Key: ***"]
+        );
+        assert_eq!(m(&["X-Auth-Token:abc123"]), ["X-Auth-Token:***"]);
+        assert_eq!(m(&["--header=X-API-KEY: abc"]), ["--header=X-API-KEY: ***"]);
+        assert_eq!(
+            m(&["-H", "Authorization: Basic dXNlcjpwYXNz"]),
+            ["-H", "Authorization: Basic ***"]
+        );
+        assert_eq!(
+            m(&["sh", "-c", "curl -H 'X-Api-Key: abc' https://x"]),
+            ["sh", "-c", "curl -H 'X-Api-Key: ***' https://x"]
+        );
+        for s in [
+            "Content-Type: application/json",
+            "https://host:8080/x",
+            "key://x",
+        ] {
+            assert_eq!(m(&[s]), [s]);
+        }
     }
 
     // Review finding 1: a known prefix inside a longer argument (sh -c, JSON, headers).
