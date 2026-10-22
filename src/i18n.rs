@@ -690,10 +690,6 @@ pub enum Msg {
         parent: Option<u32>,
     },
     KillNothing,
-    /// `X` on the orphan category, which has only suspected orphans (`n`).
-    KillOnlySuspected {
-        n: usize,
-    },
     SelectionGone,
     UnreadableProcs {
         n: usize,
@@ -736,7 +732,6 @@ impl Msg {
                 parent: Some(200),
             },
             Msg::KillNothing,
-            Msg::KillOnlySuspected { n: 3 },
             Msg::SelectionGone,
             Msg::UnreadableProcs { n: 37 },
             Msg::WindowsTooOld,
@@ -833,14 +828,6 @@ pub fn msg(lang: Lang, m: &Msg) -> String {
         Msg::KillNothing => match lang {
             Lang::ZhTw => "沒有可以結束的 process：它們可能已經自己結束了；請等畫面更新後再看".to_string(),
             Lang::En => "There is nothing to end: the processes may have already ended on their own; check again after the next refresh".to_string(),
-        },
-        Msg::KillOnlySuspected { n } => match lang {
-            Lang::ZhTw => format!(
-                "已失聯的 process 都只是『疑似』（{n} 個），為了安全不能一次全部結束；請逐一檢查後用 x 結束"
-            ),
-            Lang::En => format!(
-                "The orphaned processes are all only suspected ({n}), so to be safe they cannot be ended all at once; check each one and end it with x"
-            ),
         },
         Msg::SelectionGone => match lang {
             Lang::ZhTw => "剛才選取的 process 已結束".to_string(),
@@ -1145,25 +1132,24 @@ mod tests {
             Msg::KillRefusedOtherUser { .. } => 6,
             Msg::KillRefusedZombie { .. } => 7,
             Msg::KillNothing => 8,
-            Msg::KillOnlySuspected { .. } => 9,
-            Msg::SelectionGone => 10,
-            Msg::UnreadableProcs { .. } => 11,
-            Msg::WindowsTooOld => 12,
-            Msg::ConfigUnreadable { .. } => 13,
-            Msg::TooSmall { .. } => 14,
-            Msg::NotATty => 15,
-            Msg::WslBanner => 16,
-            Msg::WslHint => 17,
+            Msg::SelectionGone => 9,
+            Msg::UnreadableProcs { .. } => 10,
+            Msg::WindowsTooOld => 11,
+            Msg::ConfigUnreadable { .. } => 12,
+            Msg::TooSmall { .. } => 13,
+            Msg::NotATty => 14,
+            Msg::WslBanner => 15,
+            Msg::WslHint => 16,
         }
     }
 
     #[test]
     fn samples_cover_each_variant_once() {
-        let mut seen = [0usize; 18];
+        let mut seen = [0usize; 17];
         for m in Msg::samples() {
             seen[variant_index(&m)] += 1;
         }
-        assert_eq!(seen, [1; 18]);
+        assert_eq!(seen, [1; 17]);
     }
 
     #[test]
@@ -1217,8 +1203,6 @@ mod tests {
                 "250",
             );
             has(&Msg::UnreadableProcs { n: 37 }, "37");
-            has(&Msg::KillOnlySuspected { n: 3 }, "3");
-            has(&Msg::KillOnlySuspected { n: 3 }, "x");
             has(
                 &Msg::ConfigUnreadable {
                     path: "/home/u/.claude.json".into(),
