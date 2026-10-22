@@ -1,3 +1,4 @@
+pub mod classify;
 pub mod collect;
 pub mod dump;
 pub mod mask;
