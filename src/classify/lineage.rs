@@ -387,11 +387,11 @@ fn dot_dir_under<'p>(path: &'p str, home: &str) -> Option<&'p str> {
 }
 
 /// The last path component, splitting on both `/` and `\`.
-fn file_name(path: &str) -> &str {
+pub(super) fn file_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
-fn strip_executable_extension(file: &str) -> &str {
+pub(super) fn strip_executable_extension(file: &str) -> &str {
     match file.rsplit_once('.') {
         Some((stem, ext))
             if !stem.is_empty()
