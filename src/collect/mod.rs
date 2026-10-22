@@ -142,6 +142,11 @@ pub struct Collector {
     /// process's environment (see the module docs).
     sys: System,
     statics: HashMap<ProcKey, StaticInfo>,
+    /// Keys first seen on the previous tick. A process that was just started
+    /// can still be in an early shape (`npx` shows as `node .../npx -y pkg`,
+    /// then `npm`, then `npm exec pkg`, within ~70 ms), so their command line
+    /// is read once more on the next tick, and never again.
+    pending_reread: Vec<ProcKey>,
     /// The previous reading of each process's accumulated CPU time (ms) and
     /// when it was taken. A key without an entry has no CPU figure yet.
     cpu_prev: HashMap<ProcKey, (u64, Instant)>,
@@ -162,6 +167,7 @@ impl Collector {
         Collector {
             sys,
             statics: HashMap::new(),
+            pending_reread: Vec::new(),
             cpu_prev: HashMap::new(),
             own_uid: None,
             self_pid: sysinfo::get_current_pid()
@@ -211,6 +217,10 @@ impl Collector {
             })
             .collect();
 
+        // Keys first seen on the previous tick get their command line read once
+        // more (see `pending_reread`).
+        reread_command_lines(&std::mem::take(&mut self.pending_reread), &mut self.statics);
+
         // Static fields: only for keys not seen before. The environment and cwd
         // are read only for new, own-user, non-zombie processes.
         let own_uid = &self.own_uid;
@@ -248,6 +258,8 @@ impl Collector {
                 },
             );
         }
+
+        self.pending_reread = new.iter().map(|(key, _)| *key).collect();
 
         // Dynamic cheap fields, merged with the cached static ones.
         let mut procs = Vec::with_capacity(live.len());
@@ -380,6 +392,49 @@ fn read_env_and_cwd(
             })
         })
         .collect()
+}
+
+/// Reads the name, executable and command line of `pending` once more, through
+/// a throwaway `System` (so no environment is read), and replaces the cached
+/// values. The environment and cwd stay as first read. A process that is gone,
+/// whose pid was reused, or whose command line cannot be read keeps what it had.
+fn reread_command_lines(pending: &[ProcKey], statics: &mut HashMap<ProcKey, StaticInfo>) {
+    let pids: Vec<SysPid> = pending
+        .iter()
+        .filter(|key| statics.contains_key(key))
+        .map(|key| SysPid::from_u32(key.pid))
+        .collect();
+    if pids.is_empty() {
+        return;
+    }
+    let mut tmp = System::new();
+    tmp.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&pids),
+        false,
+        ProcessRefreshKind::nothing()
+            .without_tasks()
+            .with_cmd(UpdateKind::Always)
+            .with_exe(UpdateKind::Always),
+    );
+    for key in pending {
+        let (Some(info), Some(p)) = (statics.get_mut(key), tmp.process(SysPid::from_u32(key.pid)))
+        else {
+            continue;
+        };
+        if p.start_time() != key.start_time || p.cmd().is_empty() {
+            continue;
+        }
+        let exe = p.exe().map(|e| e.to_string_lossy().into_owned());
+        info.argv = normalize_argv(
+            p.cmd()
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect(),
+            exe.as_deref(),
+        );
+        info.name = p.name().to_string_lossy().into_owned();
+        info.exe = exe;
+    }
 }
 
 fn is_own_user(p: &Process, own_uid: &Option<Uid>) -> bool {
@@ -713,6 +768,25 @@ mod tests {
             "{:?}",
             busy.cpu
         );
+    }
+
+    #[test]
+    fn command_line_of_a_new_process_is_read_again_exactly_once() {
+        let child = spawn_sleeper();
+        let mut c = Collector::new();
+        let key = by_pid(&c.snapshot(), child.id()).unwrap().key;
+        assert!(c.pending_reread.contains(&key));
+        let stale = vec!["stale".to_string()];
+        let tick = |c: &mut Collector, argv: &[String]| {
+            c.statics.get_mut(&key).unwrap().argv = argv.to_vec();
+            c.snapshot();
+            c.statics[&key].argv.clone()
+        };
+        // The next tick reads the real command line again ...
+        assert_ne!(tick(&mut c, &stale), stale);
+        assert!(!c.pending_reread.contains(&key));
+        // ... and the tick after that does not.
+        assert_eq!(tick(&mut c, &stale), stale);
     }
 
     #[test]
