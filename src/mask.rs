@@ -233,25 +233,31 @@ fn mask_embedded_assignments(s: &str) -> String {
 }
 
 /// The rule [`mask_argv`] applies to separate arguments, for a command kept as
-/// one argument (`sh -c "tool --api-key abc"`): the word after a secret-named
-/// flag is masked, quotes kept. Decided from the original text, so
-/// `--token --password x` masks both values.
+/// one argument (`sh -c "tool --api-key abc"`): the text is split into
+/// whitespace-separated words, and the word after a secret flag
+/// ([`is_secret_flag`], after leading quotes or `(;&|`) is masked, quotes kept.
+/// Each word is looked at once, and `--token --password x` masks both values.
 fn mask_embedded_flag_values(s: &str) -> String {
+    let mut words: Vec<(usize, usize)> = Vec::new();
+    let mut start = None;
+    for (i, c) in s.char_indices() {
+        match (c.is_whitespace(), start) {
+            (true, Some(st)) => {
+                words.push((st, i));
+                start = None;
+            }
+            (false, None) => start = Some(i),
+            _ => {}
+        }
+    }
+    if let Some(st) = start {
+        words.push((st, s.len()));
+    }
     let mut values: Vec<(usize, usize)> = Vec::new();
-    for (i, _) in s.char_indices().filter(|&(_, c)| c == '-') {
-        if !is_assignment_boundary(s[..i].chars().next_back()) {
-            continue;
-        }
-        // A flag name is `[A-Za-z0-9_.-]`; ending it there keeps the scan linear.
-        let flag_end = i + s[i..]
-            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
-            .unwrap_or(s.len() - i);
-        if !is_secret_flag(&s[i..flag_end]) {
-            continue;
-        }
-        let after = &s[flag_end..];
-        let value_start = flag_end + (after.len() - after.trim_start().len());
-        if value_start == flag_end {
+    for pair in words.windows(2) {
+        let (flag, (value_start, _)) = (pair[0], pair[1]);
+        let flag = s[flag.0..flag.1].trim_start_matches(['\'', '"', '`', '(', ';', '&', '|']);
+        if !is_secret_flag(flag) {
             continue;
         }
         let (quote_len, value_len) = assignment_value(&s[value_start..]);
@@ -533,6 +539,7 @@ mod tests {
             m(&["zsh", "-c", "x --token --password 'p q' && y"]),
             ["zsh", "-c", "x --token *** '***' && y"]
         );
+        assert_eq!(m(&["x --password: abc"]), ["x --password: ***"]);
         for s in [
             "git log --oneline -5",
             "npm run build --key",
