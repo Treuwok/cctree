@@ -27,7 +27,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use crate::tree::{Label, Node, NodeId};
+use crate::tree::{self, Label, Node, NodeId};
 
 use super::state::{SortKey, UiState, refresh_path};
 
@@ -212,17 +212,22 @@ pub(super) fn ancestors(rows: &[Row], i: usize) -> Vec<NodeId> {
 
 /// Keeps the cursor on its row after a refresh, a new sort or a new search.
 /// When its row is not listed any more it goes to the deepest row of
-/// [`UiState::selected_path`] that is, or the first row, and this returns
-/// `true`. With no cursor yet it goes to the first row (nothing lost, `false`).
-pub fn reselect(st: &mut UiState, rows: &[Row]) -> bool {
+/// [`UiState::selected_path`] that is, or the first row. It returns `true`
+/// only when the row is not in `roots` either, that is when the process is
+/// gone; a row that is just hidden (an ancestor was folded, a search does not
+/// match it) gives `false`. With no cursor yet it goes to the first row
+/// (nothing lost, `false`).
+pub fn reselect(st: &mut UiState, rows: &[Row], roots: &[Node]) -> bool {
     let at = |id: &NodeId| rows.iter().position(|r| r.id == *id);
-    let (to, lost) = match st.selected.as_ref().map(at) {
+    let (to, lost) = match st.selected.as_ref() {
         None => (0, false),
-        Some(Some(i)) => (i, false),
-        Some(None) => (
-            st.selected_path.iter().rev().find_map(at).unwrap_or(0),
-            true,
-        ),
+        Some(sel) => match at(sel) {
+            Some(i) => (i, false),
+            None => (
+                st.selected_path.iter().rev().find_map(at).unwrap_or(0),
+                tree::find(roots, sel).is_none(),
+            ),
+        },
     };
     st.selected = rows.get(to).map(|r| r.id.clone());
     if st.selected.is_none() {

@@ -77,15 +77,31 @@ mod tests {
         assert!(matches!(sel, NodeId::Proc(_)));
         s.sort = SortKey::Name;
         let r2 = flatten(&t, &s, Instant::now());
-        assert!(!reselect(&mut s, &r2));
+        assert!(!reselect(&mut s, &r2, &t));
         assert_eq!(s.selected, Some(sel));
         let t3 = tree(
             base().into_iter().filter(|p| p.key.pid != 200).collect(),
             ViewMode::BySession,
         );
         let r3 = flatten(&t3, &s, Instant::now());
-        assert!(reselect(&mut s, &r3));
+        assert!(reselect(&mut s, &r3, &t3));
         assert_eq!(s.selected, Some(NodeId::Category(Category::ClaudeCode)));
+    }
+
+    #[test]
+    fn folding_the_parent_moves_the_cursor_without_losing_it() {
+        let t = tree(base(), ViewMode::BySession);
+        let mut s = st();
+        s.expanded
+            .insert(flatten(&t, &s, Instant::now())[1].id.clone());
+        let r = flatten(&t, &s, Instant::now());
+        apply(&mut s, &Action::Select(2), &r, 10);
+        assert!(matches!(s.selected, Some(NodeId::SelfRow(_))));
+        apply(&mut s, &Action::ToggleAt(1), &r, 10);
+        let r2 = flatten(&t, &s, Instant::now());
+        assert!(!reselect(&mut s, &r2, &t));
+        assert_eq!(s.selected, Some(r2[1].id.clone()));
+        assert!(matches!(s.selected, Some(NodeId::Proc(_))));
     }
 
     #[test]
