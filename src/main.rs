@@ -1,5 +1,8 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
+
+use cctree::i18n::{Msg, detect_lang, msg};
 
 const USAGE: &str = "\
 Usage: cctree [OPTIONS]
@@ -42,9 +45,21 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
 
 fn main() -> ExitCode {
     match parse_args(std::env::args().skip(1)) {
-        Ok(Cli::Run | Cli::Version) => {
-            // The interactive view is added in a later task; until then a bare
-            // `cctree` only identifies itself.
+        Ok(Cli::Run) => {
+            let lang = detect_lang(&|name| std::env::var(name).ok(), windows_langid());
+            if !std::io::stdout().is_terminal() {
+                eprintln!("cctree: {}", msg(lang, &Msg::NotATty));
+                return ExitCode::from(1);
+            }
+            match cctree::ui::app::run(lang) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("cctree: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Ok(Cli::Version) => {
             println!("cctree {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
@@ -68,6 +83,18 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// The Windows user interface language, for [`detect_lang`].
+#[cfg(windows)]
+fn windows_langid() -> Option<u16> {
+    // SAFETY: takes no arguments and only reads the user's setting.
+    Some(unsafe { windows::Win32::Globalization::GetUserDefaultUILanguage() })
+}
+
+#[cfg(not(windows))]
+fn windows_langid() -> Option<u16> {
+    None
 }
 
 #[cfg(test)]

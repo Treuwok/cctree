@@ -1,8 +1,10 @@
-//! The UI (spec 4.6): its state, the logic that turns a tree into rows, and
-//! the drawing of those rows ([`render`]). Only [`render`] knows about the
-//! terminal.
+//! The UI (spec 4.6): its state, the logic that turns a tree into rows, the
+//! drawing of those rows ([`render`]), the input ([`keys`]) and the program
+//! that ties them to the terminal and the worker ([`app`]).
 
+pub mod app;
 pub mod flatten;
+pub mod keys;
 #[cfg(test)]
 pub(crate) mod mock;
 pub mod render;

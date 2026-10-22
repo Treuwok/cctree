@@ -11,3 +11,4 @@ pub mod model;
 pub(crate) mod testkit;
 pub mod tree;
 pub mod ui;
+pub mod worker;
