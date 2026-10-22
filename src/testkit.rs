@@ -17,11 +17,13 @@
 
 use std::collections::BTreeMap;
 
+use crate::classify::classify;
 use crate::config::{McpConfigs, McpScope, McpServerConfig};
 use crate::model::{
     MemInfo, MemUnavailable, Pid, Platform, ProcKey, ProcStatus, RawProc, Snapshot, SystemInfo,
     Tool,
 };
+use crate::tree::{Node, ViewMode, build_tree};
 
 /// Builds a snapshot around `procs`. cctree itself is the (absent) process
 /// `99999` started at `1`, and the home directory is `/Users/u`.
@@ -106,6 +108,13 @@ pub(crate) fn base() -> Vec<RawProc> {
         p(221, 220, 22, &["node", "/x/.bin/playwright-mcp"]).env("CLAUDE_CODE_SESSION_ID", "S1"),
         p(230, 200, 30, &["/bin/zsh", "-c", "ls"]),
     ]
+}
+
+/// Classifies `v` on macOS with [`cfgs`] and builds the `view` tree.
+pub(crate) fn tree(v: Vec<RawProc>, view: ViewMode) -> Vec<Node> {
+    let s = snap(Platform::MacOs, v);
+    let c = classify(&s, &cfgs());
+    build_tree(&s, &c, view)
 }
 
 /// The last path component, splitting on both `/` and `\`.

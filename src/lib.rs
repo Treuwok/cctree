@@ -6,3 +6,4 @@ pub mod mask;
 pub mod model;
 #[cfg(test)]
 pub(crate) mod testkit;
+pub mod tree;
