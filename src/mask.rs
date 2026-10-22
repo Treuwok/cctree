@@ -7,15 +7,15 @@
 /// What a masked value is replaced with.
 const MASK: &str = "***";
 
-/// Flags whose next argument is a secret (matched exactly).
-const SECRET_FLAGS: &[&str] = &["--api-key", "--token", "--password", "--secret", "--key"];
-
-/// A `--name=value` argument is masked when the lowercased name contains one of these.
+/// A flag is secret-bearing when its lowercased name contains one of these. For
+/// `--name=value` the value is masked; for `--name value` the next argument is
+/// (so `--access-token abc` and `--TOKEN abc` are covered, not just five flags).
+/// This also catches display-only false positives such as `--author x`.
 const SECRET_NAME_PARTS: &[&str] = &["key", "token", "secret", "password", "auth"];
 
-/// Well-known secret prefixes. They only count at the very start of an argument,
-/// right after `=`, or right after `: `, never as an arbitrary substring:
-/// otherwise `--disk-cache-size` (which contains `sk-`) would be masked too.
+/// Well-known secret prefixes. They only count at a word start (see
+/// [`is_prefix_boundary`]), never as an arbitrary substring: otherwise
+/// `--disk-cache-size` (which contains `sk-`) would be masked too.
 const SECRET_PREFIXES: &[&str] = &[
     "sk-",
     "ctx7sk-",
@@ -40,7 +40,7 @@ pub fn mask_argv(argv: &[String]) -> Vec<String> {
             mask_arg(arg)
         });
         // Decided from the original argument, so `--token --password x` masks both values.
-        mask_next = SECRET_FLAGS.contains(&arg.as_str()) || ends_with_bearer(arg);
+        mask_next = is_secret_flag(arg) || ends_with_bearer(arg);
     }
     masked
 }
@@ -52,10 +52,23 @@ fn mask_arg(arg: &str) -> String {
     mask_known_prefixes(&s)
 }
 
-/// Where a secret value stops: whitespace, `&`, a quote or `;`.
+/// Where a secret value stops: whitespace, `&`, `;`, a quote, or a closing bracket.
 fn secret_len(s: &str) -> usize {
-    s.find(|c: char| c.is_whitespace() || matches!(c, '&' | '"' | '\'' | ';'))
-        .unwrap_or(s.len())
+    s.find(|c: char| {
+        c.is_whitespace() || matches!(c, '&' | ';' | '"' | '\'' | '`' | ')' | ']' | '}')
+    })
+    .unwrap_or(s.len())
+}
+
+fn has_secret_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    SECRET_NAME_PARTS.iter().any(|part| lower.contains(part))
+}
+
+/// A flag with no `=` (`--access-token`) whose name says it carries a secret:
+/// the next argument is the value.
+fn is_secret_flag(arg: &str) -> bool {
+    arg.starts_with('-') && !arg.contains('=') && has_secret_name(arg)
 }
 
 fn starts_with_secret_prefix(s: &str) -> bool {
@@ -133,16 +146,24 @@ fn ends_with_bearer(arg: &str) -> bool {
 fn mask_named_assignment(arg: &str) -> String {
     if arg.starts_with('-')
         && let Some((name, _)) = arg.split_once('=')
+        && has_secret_name(name)
     {
-        let lower = name.to_ascii_lowercase();
-        if SECRET_NAME_PARTS.iter().any(|part| lower.contains(part)) {
-            return format!("{name}={MASK}");
-        }
+        return format!("{name}={MASK}");
     }
     arg.to_string()
 }
 
-/// Masks a well-known secret prefix at the start of the argument or right after `=` or `: `.
+/// A known prefix counts at the start of the argument or right after whitespace,
+/// a quote (`'` `"` `` ` ``), `=`, `:` or an opening/separating bracket (`,` `(` `[` `{`).
+/// It does not count after a letter, digit, `-`, `_`, `/` or `.`, so
+/// `--disk-cache-size`, `task-runner` and `/x/risk-report.js` stay readable.
+fn is_prefix_boundary(before: Option<char>) -> bool {
+    before.is_none_or(|c| {
+        c.is_whitespace() || matches!(c, '\'' | '"' | '`' | '=' | ':' | ',' | '(' | '[' | '{')
+    })
+}
+
+/// Masks well-known secret prefixes wherever they start a word (see [`is_prefix_boundary`]).
 fn mask_known_prefixes(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut skip_until = 0;
@@ -150,8 +171,7 @@ fn mask_known_prefixes(s: &str) -> String {
         if i < skip_until {
             continue;
         }
-        let boundary = i == 0 || s[..i].ends_with('=') || s[..i].ends_with(": ");
-        if boundary && starts_with_secret_prefix(&s[i..]) {
+        if is_prefix_boundary(s[..i].chars().next_back()) && starts_with_secret_prefix(&s[i..]) {
             out.push_str(MASK);
             skip_until = i + secret_len(&s[i..]);
         } else {
@@ -294,8 +314,103 @@ mod tests {
             "Bearer",
             "abc",
             "H: Bearer zzz",
+            "--access-token",
+            "a",
+            "bash",
+            "-c",
+            "curl --token sk-abc",
+            "{\"api_key\":\"sk-1\"}",
         ];
         let once = m(&all);
         assert_eq!(mask_argv(&once), once);
+    }
+
+    // Review finding 1: a known prefix inside a longer argument (sh -c, JSON, headers).
+    #[test]
+    fn masks_prefixes_inside_longer_arguments() {
+        let cases = [
+            ("curl --token sk-abc", "curl --token ***"),
+            ("Authorization: token ghp_x", "Authorization: token ***"),
+            ("{\"api_key\":\"sk-1\"}", "{\"api_key\":\"***\"}"),
+            ("x-api-key:AKIAABC", "x-api-key:***"),
+            ("'sk-1'", "'***'"),
+            ("\"sk-1\"", "\"***\""),
+            ("`sk-1`", "`***`"),
+            ("a,sk-1", "a,***"),
+            ("(sk-1)", "(***)"),
+            ("[sk-1]", "[***]"),
+            ("{sk-1}", "{***}"),
+            ("key:  ghp_x", "key:  ***"),
+            ("echo xoxb-1 ctx7sk-2", "echo *** ***"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(m(&["bash", "-c", input])[2], expected, "input {input:?}");
+            let once = m(&[input]);
+            assert_eq!(once[0], expected, "input {input:?}");
+            assert_eq!(mask_argv(&once), once, "not idempotent for {input:?}");
+        }
+        assert_eq!(
+            m(&["bash", "-c", "curl --token sk-abc"]),
+            ["bash", "-c", "curl --token ***"]
+        );
+    }
+
+    #[test]
+    fn prefix_after_word_characters_is_not_a_secret() {
+        for s in [
+            "a-sk-1",
+            "a_sk-1",
+            "1sk-1",
+            "/sk-1",
+            ".sk-1",
+            "x.ghp_1",
+            "--disk-cache-size=1",
+            "task-runner",
+            "/x/risk-report.js",
+            "--max-sk-1",
+            "mask-xox",
+            "taskAKIA",
+        ] {
+            assert_eq!(m(&[s]), [s], "input {s:?}");
+        }
+    }
+
+    // Review finding 2: space-separated flags are matched by name, like the `=` form.
+    #[test]
+    fn masks_next_argument_of_any_secret_named_flag() {
+        for f in [
+            "--access-token",
+            "--auth-token",
+            "--client-secret",
+            "--github-token",
+            "--TOKEN",
+            "--Api-Key",
+            "--db-password",
+            "-token",
+        ] {
+            assert_eq!(m(&[f, "abc"]), [f, "***"], "flag {f:?}");
+            let once = m(&[f, "abc", "tail"]);
+            assert_eq!(once, [f, "***", "tail"], "flag {f:?}");
+            assert_eq!(mask_argv(&once), once, "not idempotent for {f:?}");
+        }
+    }
+
+    #[test]
+    fn non_secret_flags_keep_their_values() {
+        let v = [
+            "--port",
+            "8080",
+            "--disk-cache-size",
+            "1",
+            "--browserUrl",
+            "http://127.0.0.1:9222",
+            "--autoConnect",
+            "--max-old-space-size",
+            "4096",
+            "-p",
+            "x",
+            "-",
+        ];
+        assert_eq!(m(&v), v);
     }
 }
