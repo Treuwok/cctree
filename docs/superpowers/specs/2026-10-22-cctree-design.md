@@ -390,7 +390,7 @@ cctree  每 2 秒更新 · RAM 已用 27/36 GB · swap 2.3 GB · cctree 本身 1
 
 - cctree 自己，以及它的所有祖先（例如執行它的 shell、終端機）。
 - PID 0、1，以及 root／SYSTEM 擁有的 process，一律擋下，包括用 `sudo cctree` 執行時。
-- 其他使用者的 process（Windows 上是存取被拒）。訊息要建議改用 `sudo cctree`，或以系統管理員身分執行。cctree 以 root 執行時，其他使用者（非 root）的 process 可以結束；Windows 上以系統管理員身分執行並不等於 SYSTEM，所以仍會擋下。
+- 其他使用者的 process（Windows 上是存取被拒）。訊息在 macOS／Linux 建議改用 `sudo cctree`；在 Windows 建議到 cctree 以外（工作管理員）結束，因為以系統管理員身分執行並不等於 SYSTEM，cctree 仍會擋下。cctree 以 root 執行時，其他使用者（非 root）的 process 可以結束，也會讀取它們允許清單內的環境變數與工作目錄。
 - 殭屍 process：說明它已經結束、不佔記憶體，要結束它的 parent 才會消失，並顯示 parent 的 PID。
 
 **確認視窗中的警告**

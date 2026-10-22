@@ -792,10 +792,10 @@ pub fn msg(lang: Lang, m: &Msg) -> String {
         },
         Msg::KillRefusedOtherUser { pid } => match lang {
             Lang::ZhTw => format!(
-                "PID {pid} 屬於其他使用者，目前的權限無法結束它；真的需要的話，請改用 sudo cctree（Windows 請以系統管理員身分執行）"
+                "PID {pid} 屬於其他使用者，目前的權限無法結束它；真的需要的話，macOS／Linux 請改用 sudo cctree，Windows 請在 cctree 以外用工作管理員結束它"
             ),
             Lang::En => format!(
-                "PID {pid} belongs to another user and your permissions are not enough to end it; if you really need to, restart with sudo cctree (on Windows, run as administrator)"
+                "PID {pid} belongs to another user and your permissions are not enough to end it; if you really need to, restart with sudo cctree on macOS or Linux, or end it outside cctree with Task Manager on Windows"
             ),
         },
         Msg::KillRefusedZombie {
@@ -1214,12 +1214,19 @@ mod tests {
         assert!(en.contains("sudo cctree") && en.contains("administrator"));
     }
 
+    // Running elevated on Windows does not lift this refusal, so it must not be suggested there.
     #[test]
-    fn refusals_for_other_user_suggest_elevation() {
+    fn refusals_for_other_user_suggest_sudo_or_task_manager() {
         let zh = msg(Lang::ZhTw, &Msg::KillRefusedOtherUser { pid: 9 });
-        assert!(zh.contains("sudo cctree") && zh.contains("系統管理員"));
+        assert!(
+            zh.contains("sudo cctree") && zh.contains("工作管理員") && !zh.contains("系統管理員")
+        );
         let en = msg(Lang::En, &Msg::KillRefusedOtherUser { pid: 9 });
-        assert!(en.contains("sudo cctree") && en.contains("administrator"));
+        assert!(
+            en.contains("sudo cctree")
+                && en.contains("Task Manager")
+                && !en.contains("administrator")
+        );
     }
 
     #[test]

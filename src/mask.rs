@@ -50,6 +50,7 @@ fn mask_arg(arg: &str) -> String {
     let s = mask_bearer(&s);
     let s = mask_named_assignment(&s);
     let s = mask_embedded_assignments(&s);
+    let s = mask_embedded_flag_values(&s);
     let s = mask_header_values(&s);
     mask_known_prefixes(&s)
 }
@@ -67,10 +68,12 @@ fn has_secret_name(name: &str) -> bool {
     SECRET_NAME_PARTS.iter().any(|part| lower.contains(part))
 }
 
-/// A flag with no `=` (`--access-token`) whose name says it carries a secret:
-/// the next argument is the value.
+/// A one-word flag with no `=` (`--access-token`) whose name says it carries a
+/// secret: the next argument is the value.
 fn is_secret_flag(arg: &str) -> bool {
-    arg.starts_with('-') && !arg.contains('=') && has_secret_name(arg)
+    arg.starts_with('-')
+        && !arg.contains(|c: char| c == '=' || c.is_whitespace())
+        && has_secret_name(arg)
 }
 
 fn starts_with_secret_prefix(s: &str) -> bool {
@@ -224,6 +227,45 @@ fn mask_embedded_assignments(s: &str) -> String {
             out.push_str(MASK);
             copied = resume;
         }
+    }
+    out.push_str(&s[copied..]);
+    out
+}
+
+/// The rule [`mask_argv`] applies to separate arguments, for a command kept as
+/// one argument (`sh -c "tool --api-key abc"`): the word after a secret-named
+/// flag is masked, quotes kept. Decided from the original text, so
+/// `--token --password x` masks both values.
+fn mask_embedded_flag_values(s: &str) -> String {
+    let mut values: Vec<(usize, usize)> = Vec::new();
+    for (i, _) in s.char_indices().filter(|&(_, c)| c == '-') {
+        if !is_assignment_boundary(s[..i].chars().next_back()) {
+            continue;
+        }
+        let flag_end = i + secret_len(&s[i..]);
+        if !is_secret_flag(&s[i..flag_end]) {
+            continue;
+        }
+        let after = &s[flag_end..];
+        let value_start = flag_end + (after.len() - after.trim_start().len());
+        if value_start == flag_end {
+            continue;
+        }
+        let (quote_len, value_len) = assignment_value(&s[value_start..]);
+        if value_len > 0 {
+            let start = value_start + quote_len;
+            values.push((start, start + value_len));
+        }
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut copied = 0;
+    for (start, end) in values {
+        if start < copied {
+            continue;
+        }
+        out.push_str(&s[copied..start]);
+        out.push_str(MASK);
+        copied = end;
     }
     out.push_str(&s[copied..]);
     out
@@ -471,9 +513,30 @@ mod tests {
             "{\"api_key\":\"sk-1\"}",
             "X-Api-Key: k1",
             "Authorization: Basic b64",
+            "tool --api-key k2 --token --password 'p q'",
         ];
         let once = m(&all);
         assert_eq!(mask_argv(&once), once);
+    }
+
+    // PR review: a secret flag and its value inside one argument (`sh -c "..."`).
+    #[test]
+    fn masks_secret_flag_values_inside_a_shell_command() {
+        assert_eq!(
+            m(&["sh", "-c", "tool --api-key customer-secret --verbose"]),
+            ["sh", "-c", "tool --api-key *** --verbose"]
+        );
+        assert_eq!(
+            m(&["zsh", "-c", "x --token --password 'p q' && y"]),
+            ["zsh", "-c", "x --token *** '***' && y"]
+        );
+        for s in [
+            "git log --oneline -5",
+            "npm run build --key",
+            "foo-token bar",
+        ] {
+            assert_eq!(m(&[s]), [s]);
+        }
     }
 
     // PR review: credentials passed as HTTP headers (`--header`, `-H`, `sh -c "curl -H ..."`).
