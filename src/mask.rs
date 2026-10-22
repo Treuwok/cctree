@@ -242,7 +242,10 @@ fn mask_embedded_flag_values(s: &str) -> String {
         if !is_assignment_boundary(s[..i].chars().next_back()) {
             continue;
         }
-        let flag_end = i + secret_len(&s[i..]);
+        // A flag name is `[A-Za-z0-9_.-]`; ending it there keeps the scan linear.
+        let flag_end = i + s[i..]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+            .unwrap_or(s.len() - i);
         if !is_secret_flag(&s[i..flag_end]) {
             continue;
         }

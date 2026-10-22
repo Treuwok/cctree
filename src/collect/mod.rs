@@ -224,11 +224,10 @@ impl Collector {
         reread_command_lines(&std::mem::take(&mut self.pending_reread), &mut self.statics);
 
         // Static fields: only for keys not seen before. The environment and cwd
-        // are read only for new, non-zombie processes of the own user, or of any
-        // user when cctree runs as root (`sudo cctree`, which the refusal for
-        // another user's process suggests).
+        // are read only for new, own-user, non-zombie processes. Not for other
+        // users even as root: config files are located from them, so root would
+        // open paths another user chose.
         let own_uid = &self.own_uid;
-        let any_user = own_uid.as_ref().is_some_and(is_root_uid);
         let new: Vec<(ProcKey, &Process)> = live
             .iter()
             .filter(|(key, _)| !self.statics.contains_key(key))
@@ -236,9 +235,7 @@ impl Collector {
             .collect();
         let wanted: Vec<(SysPid, u64)> = new
             .iter()
-            .filter(|(_, p)| {
-                (any_user || is_own_user(p, own_uid)) && p.status() != ProcessStatus::Zombie
-            })
+            .filter(|(_, p)| is_own_user(p, own_uid) && p.status() != ProcessStatus::Zombie)
             .map(|(key, p)| (p.pid(), key.start_time))
             .collect();
         let mut env_cwd = read_env_and_cwd(&wanted);
