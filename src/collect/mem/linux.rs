@@ -3,12 +3,12 @@
 use std::fs;
 use std::io::ErrorKind;
 
-use super::from_linux_status;
+use super::from_linux_status_bytes;
 use crate::model::{MemInfo, MemUnavailable, Pid};
 
 pub fn read(pid: Pid) -> MemInfo {
-    match fs::read_to_string(format!("/proc/{pid}/status")) {
-        Ok(text) => from_linux_status(&text),
+    match fs::read(format!("/proc/{pid}/status")) {
+        Ok(bytes) => from_linux_status_bytes(&bytes),
         Err(e) => MemInfo::unavailable(match e.kind() {
             ErrorKind::NotFound => MemUnavailable::Gone,
             ErrorKind::PermissionDenied => MemUnavailable::PermissionDenied,

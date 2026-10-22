@@ -85,6 +85,13 @@ pub fn from_linux_status(text: &str) -> MemInfo {
     }
 }
 
+/// Same as [`from_linux_status`] for the raw bytes of `/proc/<pid>/status`.
+/// The `Name:` line is the raw `comm`, which need not be valid UTF-8; the
+/// memory lines are plain ASCII, so a lossy conversion loses nothing we use.
+pub fn from_linux_status_bytes(bytes: &[u8]) -> MemInfo {
+    from_linux_status(&String::from_utf8_lossy(bytes))
+}
+
 /// Parses a `/proc/<pid>/status` value such as `"   12000 kB"` into bytes.
 fn parse_kb(value: &str) -> Option<u64> {
     let kb: u64 = value.trim().strip_suffix("kB")?.trim().parse().ok()?;
@@ -207,6 +214,32 @@ mod tests {
             (m.private, m.os_tool_value, m.unavailable),
             (None, Some(100 * 1024), Some(MemUnavailable::OsTooOld))
         );
+    }
+
+    #[test]
+    fn linux_status_with_non_utf8_name_still_maps() {
+        // `comm` is cut at 15 bytes, which can split a multibyte character.
+        let mut t = b"Name:\t\xe4\xb8\n".to_vec();
+        t.extend_from_slice(b"VmRSS:\t 12000 kB\nRssAnon:\t 8000 kB\nRssFile:\t 3000 kB\n");
+        t.extend_from_slice(b"RssShmem:\t 1000 kB\nVmSwap:\t 500 kB\n");
+        let m = from_linux_status_bytes(&t);
+        assert_eq!(
+            (
+                m.private,
+                m.in_ram,
+                m.swapped_out,
+                m.shared,
+                m.os_tool_value
+            ),
+            (
+                Some(8500 * 1024),
+                Some(8000 * 1024),
+                Some(500 * 1024),
+                Some(4000 * 1024),
+                Some(12000 * 1024)
+            )
+        );
+        assert!(m.unavailable.is_none());
     }
 
     #[test]
