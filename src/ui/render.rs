@@ -750,12 +750,15 @@ impl Ui<'_> {
             let line = format!("  {:>pid_w$}  {}", t.key.pid, t.name);
             (clip(&line, text_w), Style::default())
         };
+        // The session's own list leaves room for a few detached names, so the
+        // detached section is never hidden behind a long list.
+        let own_cap = MAX_LISTED - detached.len().min(3);
         let mut listed = 0;
-        for t in own.iter().take(MAX_LISTED) {
+        for t in own.iter().take(own_cap) {
             lines.push(target(t));
             listed += 1;
         }
-        if listed < MAX_LISTED && !detached.is_empty() {
+        if !detached.is_empty() {
             push(&mut lines, tr(lang, Text::DialogDetachedHeader), look.dim());
             for t in detached.iter().take(MAX_LISTED - listed) {
                 lines.push(target(t));
@@ -1246,6 +1249,34 @@ mod tests {
             s.selected = Some(NodeId::Mcp(proc_key(49815)));
             s.dialog = Some(Dialog::ConfirmKill(mock_mcp_plan()));
         }));
+    }
+
+    #[test]
+    fn kill_dialog_names_some_detached_processes_after_a_long_own_list() {
+        let target = |pid: u32, name: String, detached: bool| KillTarget {
+            key: ProcKey { pid, start_time: 1 },
+            name,
+            detached,
+            mem: None,
+        };
+        let mut targets: Vec<KillTarget> = (1000..1012)
+            .map(|pid| target(pid, format!("own-{pid}"), false))
+            .collect();
+        targets.extend((2000..2002).map(|pid| target(pid, format!("lost-{pid}"), true)));
+        let plan = KillPlan {
+            subject: NodeId::Proc(proc_key(49049)),
+            targets,
+            warnings: Vec::new(),
+            freed: 0,
+            freed_approx: false,
+            force_only: false,
+        };
+        let out = render(100, 40, true, |s| {
+            s.dialog = Some(Dialog::ConfirmKill(plan))
+        });
+        for want in ["已脫離（仍屬於這個 session）", "lost-2000", "lost-2001"] {
+            assert!(out.contains(want), "{want}\n{out}");
+        }
     }
 
     #[test]
