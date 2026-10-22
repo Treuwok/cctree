@@ -1,9 +1,9 @@
 //! Turns a raw [`Snapshot`] into the process roles the
 //! tree is built from: which processes are Claude Code / Codex sessions, which
 //! are their MCP servers (and what each member of an MCP node does), and which
-//! are other children of a session. Detached, orphaned and other Node.js
-//! processes are a later pass; every process this module leaves without a role
-//! is [`Role::Unrelated`].
+//! are other children of a session. A second pass over what is left
+//! (`orphan`) finds the detached, orphaned and other Node.js processes; every
+//! process left without a role is [`Role::Unrelated`].
 //!
 //! [`classify`] walks the validated process forest ([`Lineage`]) once, top
 //! down in pre-order, carrying where the walk is: outside every session, at a
@@ -47,6 +47,7 @@
 
 pub mod argv;
 pub mod lineage;
+mod orphan;
 pub mod rules;
 
 use std::collections::{HashMap, HashSet};
@@ -153,7 +154,9 @@ pub struct SessionInfo {
     pub app_server: bool,
     /// For a nested session, the root of the nearest enclosing session.
     pub outer: Option<ProcKey>,
-    /// See the module documentation. Always `None` for Codex.
+    /// See the module documentation. Always `None` for Codex. A resumed
+    /// session's members can carry more than one id; this is only the first,
+    /// but the detached/orphan pass knows every id seen on a member.
     pub claude_session_id: Option<String>,
 }
 
@@ -298,6 +301,7 @@ pub fn classify(snap: &Snapshot, configs: &McpConfigs) -> Classification {
         );
     }
 
+    orphan::assign_rest(snap, &l, &walk.sessions, &mut roles);
     Classification {
         sessions: walk.sessions,
         roles,
@@ -474,12 +478,15 @@ fn scope_rank(scope: &McpScope, own_dirs: [Option<&str>; 2]) -> u8 {
 /// Whether two directory paths name the same directory, ignoring the
 /// separator style, a trailing separator and ASCII case.
 fn same_dir(a: &str, b: &str) -> bool {
-    let norm = |d: &str| {
-        d.replace('\\', "/")
-            .trim_end_matches('/')
-            .to_ascii_lowercase()
-    };
-    !a.is_empty() && norm(a) == norm(b)
+    !a.is_empty() && dir_key(a) == dir_key(b)
+}
+
+/// `d` in the form [`same_dir`] compares: `/` separators, no trailing one,
+/// ASCII lowercase.
+fn dir_key(d: &str) -> String {
+    d.replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -676,7 +683,7 @@ mod tests {
             assert_eq!((*session, *h, *got, plugin), (k(200), k(head), part, &None));
         }
         assert_eq!(c.role(k(230)), &Role::OtherChild { session: k(200) });
-        // The login shell and launchd are left for the next pass.
+        // The login shell and launchd stay unrelated after both passes.
         assert_eq!(c.role(k(100)), &Role::Unrelated);
         assert_eq!(c.role(k(1)), &Role::Unrelated);
         assert_eq!(c.category_of(k(100)), None);

@@ -342,7 +342,7 @@ fn is_subreaper(p: &RawProc) -> bool {
 /// subreaper (`systemd --user`, WSL's `/init`), one named in [`SYSTEM_ROOTS`]
 /// (`launchd`, `systemd` with any arguments, `init`, `explorer.exe`,
 /// `services.exe`), or the Windows `System` process (PID 4).
-fn is_system_root(p: &RawProc) -> bool {
+pub(super) fn is_system_root(p: &RawProc) -> bool {
     p.key.pid <= 1
         || (p.key.pid == 4 && p.name.eq_ignore_ascii_case("System"))
         || SYSTEM_ROOTS.iter().any(|r| p.name.eq_ignore_ascii_case(r))
