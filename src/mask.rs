@@ -284,8 +284,13 @@ fn mask_embedded_flag_values(s: &str) -> String {
 /// Masks the string value of a JSON property whose quoted name contains
 /// key/token/secret/password/auth: `"apiKey":"abc"` becomes `"apiKey":"***"`,
 /// e.g. in `claude --mcp-config '{"mcpServers":{"x":{"env":{"API_KEY":"abc"}}}}'`.
-/// Other values (numbers, objects) are left alone.
+/// JSON escaped inside a shell string (`{\"token\":\"abc\"}`) counts too, so a
+/// `\"` ends the value. Other values (numbers, objects) are left alone.
 fn mask_json_values(s: &str) -> String {
+    // A quote, optionally escaped with a backslash.
+    fn quote(t: &str) -> Option<&str> {
+        t.strip_prefix('\\').unwrap_or(t).strip_prefix('"')
+    }
     let mut out = String::with_capacity(s.len());
     let mut copied = 0;
     let mut resume = 0;
@@ -297,20 +302,22 @@ fn mask_json_values(s: &str) -> String {
         let name_len = rest
             .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
             .unwrap_or(rest.len());
-        if name_len == 0
-            || !rest[name_len..].starts_with('"')
-            || !has_secret_name(&rest[..name_len])
-        {
+        if name_len == 0 || !has_secret_name(&rest[..name_len]) {
             continue;
         }
-        let Some(after) = rest[name_len + 1..].trim_start().strip_prefix(':') else {
+        let Some(after) = quote(&rest[name_len..]).and_then(|t| t.trim_start().strip_prefix(':'))
+        else {
             continue;
         };
-        let Some(value) = after.trim_start().strip_prefix('"') else {
+        let Some(value) = quote(after.trim_start()) else {
             continue;
         };
         let value_start = s.len() - value.len();
-        let value_len = value.find('"').unwrap_or(value.len());
+        let value_len = match value.find('"') {
+            Some(q) if value[..q].ends_with('\\') => q - 1,
+            Some(q) => q,
+            None => value.len(),
+        };
         resume = value_start + value_len;
         if value_len > 0 {
             out.push_str(&s[copied..value_start]);
@@ -370,10 +377,11 @@ fn mask_header_values(s: &str) -> String {
             let rest = &s[value_start + word_len..];
             value_start += word_len + (rest.len() - rest.trim_start().len());
         }
-        let value_len = secret_len(&s[value_start..]);
-        resume = value_start + value_len;
+        let (quote_len, value_len) = assignment_value(&s[value_start..]);
+        let content_start = value_start + quote_len;
+        resume = content_start + value_len;
         if value_len > 0 {
-            out.push_str(&s[copied..value_start]);
+            out.push_str(&s[copied..content_start]);
             out.push_str(MASK);
             copied = resume;
         }
@@ -608,6 +616,10 @@ mod tests {
             ]
         );
         assert_eq!(m(&[r#"{"apiKey" : "s3cr3t"}"#]), [r#"{"apiKey" : "***"}"#]);
+        assert_eq!(
+            m(&[r#"claude --mcp-config "{\"token\":\"customer-secret\"}""#]),
+            [r#"claude --mcp-config "{\"token\":\"***\"}""#]
+        );
         for s in [r#"{"model":"gpt","n":"1"}"#, r#"{"token":5}"#, r#""key""#] {
             assert_eq!(m(&[s]), [s]);
         }
@@ -626,6 +638,10 @@ mod tests {
             ["mcp-remote", "https://x/mcp", "--header", "X-Api-Key: ***"]
         );
         assert_eq!(m(&["X-Auth-Token:abc123"]), ["X-Auth-Token:***"]);
+        assert_eq!(
+            m(&[r#"X-Api-Key: "customer-secret""#]),
+            [r#"X-Api-Key: "***""#]
+        );
         assert_eq!(m(&["--header=X-API-KEY: abc"]), ["--header=X-API-KEY: ***"]);
         assert_eq!(
             m(&["-H", "Authorization: Basic dXNlcjpwYXNz"]),

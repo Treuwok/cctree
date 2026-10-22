@@ -59,6 +59,7 @@ pub fn p(pid: Pid, ppid: Pid, start: u64, argv: &[&str]) -> RawProc {
         env: BTreeMap::new(),
         is_own_user: true,
         is_root_user: false,
+        owner_unknown: false,
         status: ProcStatus::Running,
         cpu: Some(0.0),
         mem: Some(MemInfo {
@@ -153,6 +154,13 @@ impl RawProc {
     pub fn root_user(mut self) -> RawProc {
         self.is_own_user = false;
         self.is_root_user = true;
+        self
+    }
+
+    /// A process whose owner could not be read.
+    pub fn unknown_owner(mut self) -> RawProc {
+        self.is_own_user = false;
+        self.owner_unknown = true;
         self
     }
 

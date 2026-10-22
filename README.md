@@ -142,7 +142,7 @@ Each row is marked **confirmed** or **suspected**, and the detail panel says why
 
 - cctree does not use the network, collects no telemetry and writes no files while it runs.
 - It reads process information and, read-only, the `command` and `args` of the MCP servers in your Claude Code and Codex config files. Config `env` values are never read.
-- Command lines are masked before they are shown (API keys, tokens, passwords, `Bearer` values, secret headers such as `X-Api-Key:`, credentials in URLs). There is no option to show the original.
+- Command lines are masked before they are shown (API keys, tokens, passwords, `Bearer` values, secret headers such as `X-Api-Key:`, credentials in URLs). There is no option to show the original. Masking works from common patterns and cannot catch every form.
 - From other processes it keeps only a short list of environment variable names (`CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_PROJECT_DIR`, `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_ENTRYPOINT`, `CODEX_HOME`); every other variable is dropped without being stored.
 
 ## WSL

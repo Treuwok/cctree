@@ -356,10 +356,14 @@ impl<'a> Ctx<'a> {
     }
 }
 
-/// System processes are refused, and so are other users' unless cctree runs
-/// as root; the first one in `procs` is named.
+/// System processes and processes whose owner could not be read are refused,
+/// and so are other users' unless cctree runs as root; the first one in
+/// `procs` is named.
 fn refuse_owner(procs: &[&RawProc], self_is_root: bool) -> Result<(), KillRefusal> {
-    if let Some(p) = procs.iter().find(|p| p.key.pid <= 1 || p.is_root_user) {
+    if let Some(p) = procs
+        .iter()
+        .find(|p| p.key.pid <= 1 || p.is_root_user || p.owner_unknown)
+    {
         return Err(KillRefusal::System { pid: p.key.pid });
     }
     if !self_is_root && let Some(p) = procs.iter().find(|p| !p.is_own_user) {
@@ -1259,13 +1263,16 @@ mod tests {
         v.push(p(99999, 100, 90, &["cctree"]).root_user());
         v.push(p(251, 200, 61, &["node", "x"]).root_user());
         v.push(p(252, 200, 61, &["node", "y"]).other_user());
+        v.push(p(253, 200, 61, &["node", "z"]).unknown_owner());
         let (mut s, c, t) = setup(v, Platform::MacOs);
         s.self_key = s.index()[&99999].key;
         let k = |pid| s.index()[&pid].key;
         let one = |pid| plan_kill(&s, &c, &t, &NodeId::Proc(k(pid)), KillScope::One);
-        // Another user's process is fine now; a root process still is not.
+        // Another user's process is fine now; a root process still is not,
+        // nor one whose owner could not be read.
         assert_eq!(pids(&one(252).unwrap()), [252]);
         assert_eq!(one(251), Err(KillRefusal::System { pid: 251 }));
+        assert_eq!(one(253), Err(KillRefusal::System { pid: 253 }));
     }
 
     struct FakeProc {

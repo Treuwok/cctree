@@ -142,7 +142,7 @@ CPU 在 macOS 與 Linux 以單一核心為 100%，可以超過 100%（和 `top` 
 
 - cctree 執行時不連網、不收集任何遙測資料、不寫入任何檔案。
 - 它讀取 process 資訊，以及（唯讀）Claude Code 與 Codex 設定檔中 MCP 的 `command` 與 `args`；設定檔中的 `env` 值一律不讀。
-- 命令列一律先遮蔽再顯示（API 金鑰、token、密碼、`Bearer` 後面的值、`X-Api-Key:` 這類 header 的值、網址裡的帳號密碼），不提供顯示原文的選項。
+- 命令列一律先遮蔽再顯示（API 金鑰、token、密碼、`Bearer` 後面的值、`X-Api-Key:` 這類 header 的值、網址裡的帳號密碼），不提供顯示原文的選項。遮蔽是依常見寫法判斷的，無法保證涵蓋所有寫法。
 - 從其他 process 只保留一份短的環境變數名稱清單（`CLAUDECODE`、`CLAUDE_CODE_SESSION_ID`、`CLAUDE_PROJECT_DIR`、`CLAUDE_CONFIG_DIR`、`CLAUDE_CODE_ENTRYPOINT`、`CODEX_HOME`），其他變數一律丟棄，不會儲存。
 
 ## WSL

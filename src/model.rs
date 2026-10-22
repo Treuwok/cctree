@@ -104,6 +104,9 @@ pub struct RawProc {
     pub env: BTreeMap<String, String>,
     pub is_own_user: bool,
     pub is_root_user: bool,
+    /// The owner could not be read; such a process is never ended.
+    #[serde(default)]
+    pub owner_unknown: bool,
     pub status: ProcStatus,
     pub cpu: Option<f32>,
     pub mem: Option<MemInfo>,
@@ -163,6 +166,7 @@ mod tests {
             env: BTreeMap::from([("CLAUDECODE".into(), "1".into())]),
             is_own_user: true,
             is_root_user: false,
+            owner_unknown: false,
             status: ProcStatus::Running,
             cpu: Some(0.5),
             mem: Some(MemInfo {

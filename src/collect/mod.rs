@@ -137,6 +137,7 @@ struct StaticInfo {
     env: BTreeMap<String, String>,
     is_own_user: bool,
     is_root_user: bool,
+    owner_unknown: bool,
 }
 
 pub struct Collector {
@@ -259,6 +260,7 @@ impl Collector {
                     env,
                     is_own_user: is_own_user(p, own_uid),
                     is_root_user: p.user_id().is_some_and(is_root_uid),
+                    owner_unknown: p.user_id().is_none(),
                 },
             );
         }
@@ -288,6 +290,7 @@ impl Collector {
                 env: info.env.clone(),
                 is_own_user: info.is_own_user,
                 is_root_user: info.is_root_user,
+                owner_unknown: info.owner_unknown,
                 status: map_status(p.status()),
                 cpu,
                 mem: None,
