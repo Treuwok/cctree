@@ -7,6 +7,8 @@ use crate::model::{MemInfo, MemUnavailable, Pid};
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(windows)]
+mod windows;
 
 /// macOS: `phys_footprint` is the main figure (Activity Monitor's "Memory");
 /// `internal` is what is in RAM and `compressed` is what the system squeezed.
@@ -110,11 +112,9 @@ pub fn read_mem(pid: Pid) -> MemInfo {
     {
         macos::read(pid)
     }
-    // Task 5 replaces this arm with the Windows reader.
     #[cfg(windows)]
     {
-        let _ = pid;
-        MemInfo::unavailable(MemUnavailable::Unsupported)
+        windows::read(pid)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
