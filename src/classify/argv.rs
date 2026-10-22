@@ -313,7 +313,7 @@ fn parse(argv: &[String]) -> Parsed {
 }
 
 /// The file name of `path` without `.exe` / `.cmd` (and the like).
-fn base_name(path: &str) -> &str {
+pub(super) fn base_name(path: &str) -> &str {
     strip_executable_extension(file_name(path))
 }
 
