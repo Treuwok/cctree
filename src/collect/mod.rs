@@ -781,20 +781,24 @@ mod tests {
         );
         let mut c = Collector::new();
         c.snapshot();
-        std::thread::sleep(std::time::Duration::from_millis(1500));
-        let s = c.snapshot();
-        let busy = s.procs.iter().find(|p| p.key.pid == child.id()).unwrap();
-        assert!(
-            busy.cpu.unwrap()
-                > 5.0
-                    / if cfg!(windows) {
-                        s.system.logical_cpus as f32
-                    } else {
-                        1.0
-                    },
-            "{:?}",
-            busy.cpu
-        );
+        // The loop can start seconds after spawn (PowerShell on a busy CI
+        // machine), so wait for one busy reading rather than taking the first.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            std::thread::sleep(Duration::from_millis(1500));
+            let s = c.snapshot();
+            let cpu = by_pid(&s, child.id()).unwrap().cpu.unwrap();
+            let floor = 5.0
+                / if cfg!(windows) {
+                    s.system.logical_cpus as f32
+                } else {
+                    1.0
+                };
+            if cpu > floor {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{cpu}");
+        }
     }
 
     #[test]
