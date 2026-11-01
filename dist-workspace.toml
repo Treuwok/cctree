@@ -8,10 +8,7 @@ cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
-installers = ["shell", "powershell", "homebrew"]
-# The Homebrew tap the formula is published to (it must already exist)
-tap = "yenchiugu/homebrew-tap"
-publish-jobs = ["homebrew"]
+installers = ["shell", "powershell"]
 # The release workflow runs on version tags only, not on pull requests
 pr-run-mode = "skip"
 # Target platforms to build apps for (Rust target-triple syntax)

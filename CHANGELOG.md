@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.1.0] - 2026-10-22
+## [0.1.0] - 2026-11-01
 
 First release.
 
@@ -10,4 +10,4 @@ First release.
 - Orphans are marked "confirmed" or "suspected" as a hint; nothing is ended in a batch.
 - No network, no telemetry and no files written. Command lines are masked, and only a short list of environment variable names is read from other processes.
 - Traditional Chinese and English (`CCTREE_LANG`), `NO_COLOR`, and a notice for WSL.
-- Builds for macOS (Apple silicon and Intel), Windows x64 and Linux (x64 and arm64, static), with shell, PowerShell and Homebrew installers.
+- Builds for macOS (Apple silicon and Intel), Windows x64 and Linux (x64 and arm64, static), with shell and PowerShell installers.

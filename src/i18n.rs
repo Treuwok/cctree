@@ -259,8 +259,8 @@ catalog! {
 
     // ---- Crash report (printed as plain text after the terminal is restored) ----
     PanicReport => (
-        "cctree 發生了預期之外的錯誤而停止；終端機已恢復原狀。請到 https://github.com/yenchiugu/cctree/issues 回報，並附上下面的訊息：",
-        "cctree stopped because of an unexpected error; your terminal has been restored. Please report it at https://github.com/yenchiugu/cctree/issues and include the details below:",
+        "cctree 發生了預期之外的錯誤而停止；終端機已恢復原狀。請到 https://github.com/Treuwok/cctree/issues 回報，並附上下面的訊息：",
+        "cctree stopped because of an unexpected error; your terminal has been restored. Please report it at https://github.com/Treuwok/cctree/issues and include the details below:",
     ),
 }
 

@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "A TUI that shows the process trees of Claude Code and Codex with CPU and memory, and ends a process safely"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/yenchiugu/cctree"
-homepage = "https://github.com/yenchiugu/cctree"
+repository = "https://github.com/Treuwok/cctree"
+homepage = "https://github.com/Treuwok/cctree"
 readme = "README.md"
 exclude = ["docs/"]
 
